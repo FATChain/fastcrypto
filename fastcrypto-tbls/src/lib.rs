@@ -18,6 +18,7 @@ mod tbls_modules {
     pub mod dkg;
     pub mod ecies;
     pub mod mocked_dkg;
+    pub mod nidkg;
     pub mod polynomial;
     pub mod random_oracle;
     pub mod tbls;
@@ -46,3 +47,7 @@ pub mod random_oracle_tests;
 #[cfg(test)]
 #[path = "tests/dkg_tests.rs"]
 pub mod dkg_tests;
+
+#[cfg(test)]
+#[path = "tests/nidkg_tests.rs"]
+pub mod nidkg_tests;
