@@ -70,12 +70,28 @@ mod nidkg_benches {
             for n in SIZES {
                 let t = (n / 2) as u32;
                 let keys = gen_ecies_keys(n);
+                let d0 = setup_party(0, t, &keys);
                 let d1 = setup_party(1, t, &keys);
-                let d2 = setup_party(2, t, &keys);
-                let m = d1.create_message(&mut thread_rng());
+                let m = d0.create_message(&mut thread_rng());
 
                 verify.bench_function(format!("n={}, t={}", n, t).as_str(), |b| {
-                    b.iter(|| d2.verify_message(&m, &mut thread_rng()))
+                    b.iter(|| d1.verify_message(&m, &mut thread_rng()))
+                });
+            }
+        }
+
+        {
+            let mut verify: BenchmarkGroup<_> =
+                c.benchmark_group("NI-DKG message processing for one share");
+            for n in SIZES {
+                let t = (n / 2) as u32;
+                let keys = gen_ecies_keys(n);
+                let d0 = setup_party(0, t, &keys);
+                let d1 = setup_party(1, t, &keys);
+                let m = d0.create_message(&mut thread_rng());
+
+                verify.bench_function(format!("n={}, t={}", n, t).as_str(), |b| {
+                    b.iter(|| d1.process_message(&m, &mut thread_rng()))
                 });
             }
         }
