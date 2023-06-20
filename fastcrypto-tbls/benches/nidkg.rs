@@ -11,13 +11,13 @@ use rand::thread_rng;
 
 type G = bls12381::G1Element;
 
-fn gen_ecies_keys(n: usize) -> Vec<(ShareIndex, ecies::PrivateKey<G>, ecies::PublicKey<G>)> {
-    (1..=n)
+fn gen_ecies_keys(n: u16) -> Vec<(u16, ecies::PrivateKey<G>, ecies::PublicKey<G>)> {
+    (0..n)
         .into_iter()
         .map(|id| {
             let sk = ecies::PrivateKey::<G>::new(&mut thread_rng());
             let pk = ecies::PublicKey::<G>::from_private_key(&sk);
-            (ShareIndex::new(id as u32).unwrap(), sk, pk)
+            (id, sk, pk)
         })
         .collect()
 }
@@ -25,17 +25,18 @@ fn gen_ecies_keys(n: usize) -> Vec<(ShareIndex, ecies::PrivateKey<G>, ecies::Pub
 pub fn setup_party(
     id: usize,
     threshold: u32,
-    keys: &[(ShareIndex, ecies::PrivateKey<G>, ecies::PublicKey<G>)],
+    keys: &[(u16, ecies::PrivateKey<G>, ecies::PublicKey<G>)],
 ) -> Party<G> {
     let nodes = keys
         .iter()
         .map(|(id, _sk, pk)| Node::<G> {
             id: *id,
             pk: pk.clone(),
+            weight: 1,
         })
         .collect();
     Party::<G>::new(
-        keys.get(id - 1).unwrap().1.clone(),
+        keys.get(id).unwrap().1.clone(),
         nodes,
         threshold,
         RandomOracle::new("dkg"),
@@ -48,18 +49,18 @@ mod nidkg_benches {
     use super::*;
 
     fn nidkg(c: &mut Criterion) {
-        const SIZES: [usize; 1] = [512];
+        const SIZES: [u16; 1] = [512];
 
         {
             let mut create: BenchmarkGroup<_> = c.benchmark_group("NI-DKG create");
             for n in SIZES {
                 let t = (n / 2) as u32;
                 let keys = gen_ecies_keys(n);
+                let d0 = setup_party(0, t, &keys);
                 let d1 = setup_party(1, t, &keys);
-                let d2 = setup_party(2, t, &keys);
 
                 create.bench_function(format!("n={}, t={}", n, t).as_str(), |b| {
-                    b.iter(|| d1.create_message(&mut thread_rng()))
+                    b.iter(|| d0.create_message(&mut thread_rng()))
                 });
             }
         }
