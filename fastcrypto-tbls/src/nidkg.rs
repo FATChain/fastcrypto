@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::dl_verification::{verify_deg_t_poly, verify_pairs, verify_triplets};
 use crate::ecies;
-use crate::polynomial::{Poly, PrivatePoly, PublicPoly};
+use crate::ecies::Encryption;
+use crate::polynomial::{Eval, Poly, PrivatePoly, PublicPoly};
 use crate::random_oracle::RandomOracle;
-use crate::tbls::Share;
 use crate::types::ShareIndex;
 use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::{GroupElement, HashToGroupElement, MultiScalarMul, Scalar};
@@ -16,7 +17,15 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-// TODO: add outputs -> fraud claims -> weights
+// TODOs:
+//  process_message(...) -> (shares, fraud_claims (sender, receiver, claim)) - called after verify_message() in parallel; if there is a fraud, send it
+//  process_fraud_claim(...) -> Ok(sender, shares_to_reveal) - called per claim (but not twice per sender)
+//  process_revealed_shares(after t) -> update shares
+//
+// sign, etc
+//
+// weights
+// work in G1
 
 /// PKI node, with a unique id and its encryption public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,25 +56,26 @@ where
     precomputed_dual_code_coefficients: Vec<G::ScalarType>,
 }
 
+const NUM_OF_ENCRYPTIONS_PER_SHARE: usize = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PairOfEncryptions<G: GroupElement> {
-    pub enc0: ecies::Encryption<G>,
-    pub enc1: ecies::Encryption<G>,
+pub struct Encryptions<G: GroupElement> {
+    pub values: [ecies::Encryption<G>; NUM_OF_ENCRYPTIONS_PER_SHARE],
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 enum EncryptionInfo<G: GroupElement> {
+    // Let the encryption be (k*G, AES_{hkdf(k*xG)}(k)).
     ForVerification { k: G::ScalarType, k_x_g: G }, // k_x_g is added to reduce verification time.
-    ForEvaluation { diff: G::ScalarType },
+    ForEvaluation { diff: G::ScalarType },          // share - k
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-struct ProcessedPair<G: GroupElement>
+struct ProcessedEncryptions<G: GroupElement>
 where
     G::ScalarType: Serialize + DeserializeOwned,
 {
-    pub enc0: EncryptionInfo<G>,
-    pub enc1: EncryptionInfo<G>,
+    pub infos: [EncryptionInfo<G>; NUM_OF_ENCRYPTIONS_PER_SHARE],
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -75,10 +85,15 @@ where
 {
     sender: ShareIndex,
     // TODO: need a proof of possession/knowledge?
-    partial_pks: Vec<G>,
+    partial_pks: Vec<G>, // One per share.
     /// The encrypted shares created by the sender.
-    pairs: Vec<PairOfEncryptions<G>>,
-    processed_pairs: Vec<ProcessedPair<G>>,
+    encrypted_random_shares: Vec<Encryptions<G>>, // One per share.
+    processed_encryptions: Vec<ProcessedEncryptions<G>>, // One per share.
+}
+
+struct PartialShares<G: GroupElement> {
+    // (sender, receiver) -> share
+    shares: HashMap<(ShareIndex, ShareIndex), G::ScalarType>,
 }
 
 // #[derive(Clone, Debug)]
@@ -177,6 +192,7 @@ where
         self.nodes.len() as u32
     }
 
+    /// 4. Send the message to all parties.
     pub fn msg(&self) -> &Message<G> {
         &self.message
     }
@@ -194,31 +210,37 @@ where
             .iter()
             .map(|n| G::generator() * vss_sk.eval(n.id).value)
             .collect();
-        let mut rs = Vec::new();
+        let mut interim_values: Vec<[(G::ScalarType, G); NUM_OF_ENCRYPTIONS_PER_SHARE]> =
+            Vec::new();
         let pairs = nodes
             .iter()
             .map(|n| {
-                let (r0, r1) = (G::ScalarType::rand(rng), G::ScalarType::rand(rng));
-                let (msg0, msg1) = (
-                    bcs::to_bytes(&r0).expect("serialization should work"),
-                    bcs::to_bytes(&r1).expect("serialization should work"),
-                );
-                let (r0_g, r1_g) = (G::generator() * r0, G::generator() * r1);
-                let (r0_x_g, r1_x_g) = (*n.pk.as_element() * r0, *n.pk.as_element() * r1);
-                let (enc0, enc1) = (
-                    n.pk.deterministic_encrypt(&msg0, &r0_g, &r0_x_g),
-                    n.pk.deterministic_encrypt(&msg1, &r1_g, &r1_x_g),
-                );
-                // Save also the points instead of recomputing them later.
-                rs.push(((r0, r0_x_g), (r1, r1_x_g)));
-                PairOfEncryptions { enc0, enc1 }
+                let mut values = Vec::new();
+                let encryptions = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
+                    .into_iter()
+                    .map(|i| {
+                        let r = G::ScalarType::rand(rng);
+                        let msg = bcs::to_bytes(&r).expect("serialization should work");
+                        let r_g = G::generator() * r;
+                        let r_x_g = *n.pk.as_element() * r;
+                        // Save also the points instead of recomputing them later.
+                        values.push((r, r_x_g));
+                        n.pk.deterministic_encrypt(&msg, &r_g, &r_x_g)
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("should work");
+                interim_values.push(values.try_into().expect("should work"));
+                Encryptions {
+                    values: encryptions,
+                }
             })
             .collect();
         let msg_before_fiat_shamir = Message {
             sender: id,
-            pairs,
+            encrypted_random_shares: pairs,
             partial_pks,
-            processed_pairs: Vec::new(), // pre fiat-shamir
+            processed_encryptions: Vec::new(), // pre fiat-shamir
         };
         // Compute the cut-and-choose challenge bits.
         let ro = random_oracle.extend(format!("-{}-cut-and-choose", id).as_str());
@@ -226,39 +248,38 @@ where
         let challenge = Self::challenge(seed.as_slice(), nodes.len() as u32);
 
         // Reveal the scalars corresponding to the challenge bits.
-        let processed_pairs = izip!(nodes.iter(), challenge.iter(), rs.iter())
-            .map(
-                |(node, (to_verify0, to_verify1), ((r0, r0_x_g), (r1, r1_x_g)))| {
-                    let share = vss_sk.eval(node.id).value;
-                    let enc0 = if *to_verify0 {
-                        EncryptionInfo::ForVerification {
-                            k: *r0,
-                            k_x_g: *r0_x_g,
+        let processed_pairs = izip!(nodes.iter(), challenge.iter(), interim_values.iter())
+            .map(|(node, chal, &values)| {
+                let share = vss_sk.eval(node.id).value;
+                let infos = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
+                    .into_iter()
+                    .map(|i| {
+                        if chal[i] {
+                            EncryptionInfo::ForVerification {
+                                k: values[i].0.clone(),
+                                k_x_g: values[i].1.clone(),
+                            }
+                        } else {
+                            EncryptionInfo::ForEvaluation {
+                                diff: share - values[i].0,
+                            }
                         }
-                    } else {
-                        EncryptionInfo::ForEvaluation { diff: share - r0 }
-                    };
-                    let enc1 = if *to_verify1 {
-                        EncryptionInfo::ForVerification {
-                            k: *r1,
-                            k_x_g: *r1_x_g,
-                        }
-                    } else {
-                        EncryptionInfo::ForEvaluation { diff: share - r1 }
-                    };
-                    ProcessedPair { enc0, enc1 }
-                },
-            )
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("should work");
+                ProcessedEncryptions { infos }
+            })
             .collect();
 
         let msg_after = Message {
-            processed_pairs,
+            processed_encryptions: processed_pairs,
             ..msg_before_fiat_shamir
         };
         msg_after
     }
 
-    /// 4. Verify messages (and store the valid ones elsewhere).
+    /// 5. Verify messages (and store the valid ones elsewhere).
     pub fn verify_message<R: AllowedRng>(
         &self,
         msg: &Message<G>,
@@ -266,11 +287,16 @@ where
     ) -> FastCryptoResult<()> {
         let n = self.n();
         // Check the degree of the sender's polynomial..
-        self.verify_deg_t_poly(n - self.threshold - 1, &msg.partial_pks[..], rng)?;
+        verify_deg_t_poly(
+            n - self.threshold - 1,
+            &msg.partial_pks,
+            &self.precomputed_dual_code_coefficients,
+            rng,
+        )?;
 
         // Check the cut-and-choose encryptions.
         let msg_before_fiat_shamir = Message {
-            processed_pairs: Vec::new(),
+            processed_encryptions: Vec::new(),
             ..msg.clone()
         };
         let ro = self
@@ -283,18 +309,16 @@ where
         let mut tuples_to_check = Vec::new();
         let all_ok = izip!(
             self.nodes.iter(),
-            msg.pairs.iter(),
+            msg.encrypted_random_shares.iter(),
             challenge.iter(),
-            msg.processed_pairs.iter(),
+            msg.processed_encryptions.iter(),
             msg.partial_pks.iter()
         )
-        .all(|(node, pair, chal_bits, proc_pair, partial_pk)| {
-            for (to_verify, enc, oenc) in vec![
-                (&chal_bits.0, &pair.enc0, &proc_pair.enc0),
-                (&chal_bits.1, &pair.enc1, &proc_pair.enc1),
-            ] {
+        .all(|(node, encryptions, chal, proc_encryptions, partial_pk)| {
+            for i in (0..NUM_OF_ENCRYPTIONS_PER_SHARE) {
+                let enc = &encryptions.values[i];
                 // Some of the checks are verified as a batch below, using MSM.
-                match (to_verify, oenc) {
+                match (chal[i], &proc_encryptions.infos[i]) {
                     (true, EncryptionInfo::ForVerification { k, k_x_g }) => {
                         let msg = bcs::to_bytes(&k).expect("serialization should work");
                         let k_g = enc.ephemeral_key();
@@ -317,96 +341,60 @@ where
 
         if all_ok {
             // if true {
-            Self::verify_pairs(rng, &pairs_to_check[..])?;
-            Self::verify_triplets(rng, &tuples_to_check[..])?;
+            verify_pairs(&pairs_to_check, rng)?;
+            verify_triplets(&tuples_to_check, rng)?;
             Ok(())
         } else {
             Err(FastCryptoError::InvalidProof)
         }
     }
 
-    fn get_random_scalars<R: AllowedRng>(
-        n: u32,
-        rng: &mut R,
-    ) -> Vec<<G as GroupElement>::ScalarType> {
-        // TODO: can use 40 bits instead of 64 (& 0x000F_FFFF_FFFF_FFFF below)
-        (0..n)
-            .into_iter()
-            .map(|_| G::ScalarType::from(rng.next_u64()))
-            .collect::<Vec<_>>()
-    }
-
-    // Check that a given pair (k, H) is indeed H = k*G using a random combination of the pairs and
-    // multi scalar multiplication.
-    pub fn verify_pairs<R: AllowedRng>(
-        rng: &mut R,
-        pairs: &[(G::ScalarType, G)],
-    ) -> FastCryptoResult<()> {
-        if pairs.is_empty() {
-            return Ok(());
+    /// 6. Given enough verified messages, compute the final public keys.
+    // TODO: Should fail if not enough messages?
+    pub fn compute_final_pks(&self, messages: &[Message<G>], t: u32) -> (G, Vec<G>) {
+        let mut res = Vec::<G>::with_capacity(messages.len());
+        for msg in messages {
+            for (i, pk) in msg.partial_pks.iter().enumerate() {
+                res[i] = res[i] + pk;
+            }
         }
 
-        let random_coeffs = Self::get_random_scalars(pairs.len() as u32, rng);
-        let lhs = G::generator()
-            * random_coeffs
-                .iter()
-                .zip(pairs.iter())
-                .fold(G::ScalarType::zero(), |acc, (r, (k, _))| acc + *r * *k);
-        let rhs = G::multi_scalar_mul(
-            &random_coeffs[..],
-            &pairs.iter().map(|(_, g)| g.clone()).collect::<Vec<_>>()[..],
-        )
-        .expect("valid sizes");
-        if lhs == rhs {
-            Ok(())
-        } else {
-            Err(FastCryptoError::InvalidProof)
-        }
-    }
-
-    // Check that a given tripled (k, G, H) is indeed H = k*G using a random combination of the
-    // triplets and multi scalar multiplication.
-    fn verify_triplets<R: AllowedRng>(
-        rng: &mut R,
-        triplets: &[(G::ScalarType, G, G)],
-    ) -> FastCryptoResult<()> {
-        if triplets.is_empty() {
-            return Ok(());
-        }
-
-        let random_coeffs = Self::get_random_scalars(triplets.len() as u32, rng);
-        let lhs_coeffs = random_coeffs
+        let evals = res
             .iter()
-            .zip(triplets.iter())
-            .map(|(r, (k, _, _))| *r * *k)
-            .collect::<Vec<_>>();
-        let lhs = G::multi_scalar_mul(
-            &lhs_coeffs[..],
-            &triplets
-                .iter()
-                .map(|(_, b, _)| b.clone())
-                .collect::<Vec<_>>()[..],
-        )
-        .expect("valid sizes");
+            .take(t as usize)
+            .enumerate()
+            .map(|(i, pk)| Eval {
+                index: NonZeroU32::new((i + 1) as u32).expect("non zero"),
+                value: *pk,
+            })
+            .collect::<Vec<Eval<G>>>();
+        let pk = Poly::<G>::recover_c0(t, &evals).expect("enough shares");
 
-        let rhs = G::multi_scalar_mul(
-            &random_coeffs[..],
-            &triplets
-                .iter()
-                .map(|(_, _, k_b)| k_b.clone())
-                .collect::<Vec<_>>()[..],
-        )
-        .expect("valid sizes");
-
-        if lhs == rhs {
-            Ok(())
-        } else {
-            Err(FastCryptoError::InvalidProof)
-        }
+        (pk, res)
     }
+    //
+    // pub fn process_message(&self, msg: &Message<G>) -> (PartialShares<G>, FraudProof<G>) {
+    //     let partial_pk = msg.partial_pks[self.id - 1];
+    //     let encryptions = msg.encrypted_random_shares[self.id - 1];
+    //     let processed_encs = msg.processed_encryptions[self.id - 1];
+    //     let mut res = G::ScalarType::zero();
+    //     for i in (0..NUM_OF_ENCRYPTIONS_PER_SHARE) {
+    //         if let EncryptionInfo::ForEvaluation { diff } = processed_encs.infos[i] {
+    //             let msg = self.ecies_sk.decrypt(&encryptions.values[i]);
+    //             let k: G::ScalarType = bcs::from_bytes(&msg).expect("deserialization should work");
+    //             if G::generator() * (k + diff) == partial_pk {
+    //                 res = res + k;
+    //             } else {
+    //                 //fruad proof
+    //             }
+    //         }
+    //     }
+    //
+    //     (res, proofs)
+    // }
 
     // Returns deterministic n pairs of challenge bits 00/01/11.
-    fn challenge(seed: &[u8], n: u32) -> Vec<(bool, bool)> {
+    fn challenge(seed: &[u8], n: u32) -> Vec<[bool; NUM_OF_ENCRYPTIONS_PER_SHARE]> {
         let hmac_key = HmacKey::from_bytes(seed).expect("HMAC key should be valid");
         let mut res = Vec::new();
         let mut i: u32 = 0;
@@ -425,31 +413,9 @@ where
             let b1 = random_bits.pop().expect("non empty");
             // skip 11
             if !b0 | !b1 {
-                res.push((b0, b1));
+                res.push([b0, b1]);
             }
         }
         res
-    }
-
-    // Verify that partial public keys form a polynomial of degree threshold-1 using the
-    // protocol of https://eprint.iacr.org/2017/216.pdf.
-    fn verify_deg_t_poly<R: AllowedRng>(
-        &self,
-        deg_f: u32,
-        values: &[G],
-        rng: &mut R,
-    ) -> FastCryptoResult<()> {
-        let poly_f = PrivatePoly::<G>::rand(deg_f, rng);
-        let coefficients = self
-            .precomputed_dual_code_coefficients
-            .iter()
-            .enumerate()
-            .map(|(i, c)| *c * poly_f.eval(NonZeroU32::new((i + 1) as u32).unwrap()).value)
-            .collect::<Vec<_>>();
-        let lhs = G::multi_scalar_mul(&coefficients[..], values).expect("sizes match");
-        if lhs != G::zero() {
-            return Err(FastCryptoError::InvalidProof);
-        }
-        Ok(())
     }
 }
