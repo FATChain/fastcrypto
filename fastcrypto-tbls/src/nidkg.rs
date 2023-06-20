@@ -15,7 +15,9 @@ use fastcrypto::traits::{AllowedRng, ToFromBytes};
 use itertools::izip;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
+use std::iter::Map;
 use std::num::NonZeroU32;
+use std::ops::RangeInclusive;
 
 // TODOs:
 //  process_message(...) -> (shares, fraud_claims (sender, receiver, claim)) - called after verify_message() in parallel; if there is a fraud, send it
@@ -24,20 +26,17 @@ use std::num::NonZeroU32;
 //
 // sign, etc
 //
-// weights
 // work in G1
 
-/// PKI node, with a unique id and its encryption public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PkiNode<G: GroupElement> {
-    pub id: ShareIndex,
+pub struct Node<G: GroupElement> {
+    pub id: u16,
     pub pk: ecies::PublicKey<G>,
+    pub weight: u16,
 }
 
-// Assumptions:
-// - All parties have the same list.
-// - Their IDs are some permutation of the range(1, n) where n is the number of parties.
-pub type Nodes<G> = Vec<PkiNode<G>>;
+/// Assumptions: All parties have the same set of Nodes. Their ids are 0..n-1.
+pub type Nodes<G> = Vec<Node<G>>;
 
 /// Party in the DKG protocol.
 #[derive(Clone, PartialEq, Eq)]
@@ -45,13 +44,13 @@ pub struct Party<G: GroupElement>
 where
     G::ScalarType: Serialize + DeserializeOwned,
 {
-    id: ShareIndex,
+    id: u16,
     nodes: Nodes<G>,
-    threshold: u32,
+    t: u32,
+    n: u32,
     random_oracle: RandomOracle,
     ecies_sk: ecies::PrivateKey<G>,
     vss_sk: PrivatePoly<G>,
-    message: Message<G>,
     // Precomputed values to be used when verifying messages.
     precomputed_dual_code_coefficients: Vec<G::ScalarType>,
 }
@@ -83,7 +82,7 @@ pub struct Message<G: GroupElement>
 where
     G::ScalarType: Serialize + DeserializeOwned,
 {
-    sender: ShareIndex,
+    sender: u16,
     // TODO: need a proof of possession/knowledge?
     partial_pks: Vec<G>, // One per share.
     /// The encrypted shares created by the sender.
@@ -91,10 +90,10 @@ where
     processed_encryptions: Vec<ProcessedEncryptions<G>>, // One per share.
 }
 
-struct PartialShares<G: GroupElement> {
-    // (sender, receiver) -> share
-    shares: HashMap<(ShareIndex, ShareIndex), G::ScalarType>,
-}
+// struct PartialShares<G: GroupElement> {
+//     // (sender, receiver) -> share
+//     shares: HashMap<(ShareIndex, ShareIndex), G::ScalarType>,
+// }
 
 // #[derive(Clone, Debug)]
 // pub struct PartyPostDkg<G: GroupElement> {
@@ -123,15 +122,14 @@ where
     pub fn new<R: AllowedRng>(
         ecies_sk: ecies::PrivateKey<G>,
         nodes: Nodes<G>,
-        threshold: u32, // The number of parties that are needed to reconstruct the full signature.
+        t: u32, // The number of shares that are needed to reconstruct the full signature.
         random_oracle: RandomOracle,
         rng: &mut R,
     ) -> Result<Self, FastCryptoError> {
-        // Check all ids are consecutive and start from 1.
+        // Check all ids are consecutive and start from 0.
         let mut nodes = nodes;
         nodes.sort_by_key(|n| n.id);
-        let max_id = nodes.len();
-        if (1..=max_id).any(|i| nodes[i - 1].id != NonZeroU32::new(i as u32).unwrap()) {
+        if (0..nodes.len()).any(|i| (nodes[i].id as usize) != i) {
             return Err(FastCryptoError::InvalidInput);
         }
         // Check if my public key is in one of the nodes.
@@ -140,20 +138,22 @@ where
             .iter()
             .find(|n| n.pk == ecies_pk)
             .ok_or(FastCryptoError::InvalidInput)?;
+        // Get the total weight of the nodes.
+        let n = nodes.iter().map(|n| n.weight as u32).sum::<u32>();
         // Generate a secret polynomial.
-        if threshold >= nodes.len() as u32 {
+        if t >= n {
             return Err(FastCryptoError::InvalidInput);
         }
-        let vss_sk = PrivatePoly::<G>::rand(threshold - 1, rng);
+        let vss_sk = PrivatePoly::<G>::rand(t - 1, rng);
         // Precompute the dual code coefficients.
-        let ids_as_scalars = (1..=max_id)
+        let ids_as_scalars = (1..=n)
             .into_iter()
             .map(|i| (i, G::ScalarType::from(i as u64)))
             .collect::<HashMap<_, _>>();
-        let precomputed_dual_code_coefficients = (1..=max_id)
+        let precomputed_dual_code_coefficients = (1..=n)
             .into_iter()
             .map(|i| {
-                (1..=max_id)
+                (1..=n)
                     .into_iter()
                     .filter(|j| i != *j)
                     .map(|j| ids_as_scalars[&i] - ids_as_scalars[&j])
@@ -162,70 +162,61 @@ where
                     .expect("non zero")
             })
             .collect();
-        // Create the message to be broadcasted.
-        let message = Self::create_message(
-            rng,
-            curr_node.id,
-            &nodes,
-            threshold,
-            &random_oracle,
-            &vss_sk,
-        );
 
         Ok(Self {
             id: curr_node.id,
             nodes,
-            threshold,
+            t,
+            n,
             random_oracle,
             ecies_sk,
             vss_sk,
-            message,
             precomputed_dual_code_coefficients,
         })
     }
 
-    pub fn threshold(&self) -> u32 {
-        self.threshold
+    fn share_ids_iter(&self) -> Map<RangeInclusive<u32>, fn(u32) -> NonZeroU32> {
+        (1..=self.n)
+            .into_iter()
+            .map(|i| ShareIndex::new(i).expect("nonzero"))
     }
 
-    pub fn n(&self) -> u32 {
-        self.nodes.len() as u32
+    fn share_id_to_node(&self, share_id: ShareIndex) -> &Node<G> {
+        // TODO: Cache this
+        let mut curr_share_id = 1;
+        for n in &self.nodes {
+            if curr_share_id <= share_id.get() && share_id.get() < curr_share_id + (n.weight as u32)
+            {
+                return n;
+            }
+            curr_share_id += n.weight as u32;
+        }
+        panic!("share id not found");
     }
 
-    /// 4. Send the message to all parties.
-    pub fn msg(&self) -> &Message<G> {
-        &self.message
-    }
-
-    fn create_message<R: AllowedRng>(
-        rng: &mut R,
-        id: ShareIndex,
-        nodes: &Nodes<G>,
-        threshold: u32,
-        random_oracle: &RandomOracle,
-        vss_sk: &PrivatePoly<G>,
-    ) -> Message<G> {
+    pub fn create_message<R: AllowedRng>(&self, rng: &mut R) -> Message<G> {
         // TODO: Can this be done faster?
-        let partial_pks = nodes
-            .iter()
-            .map(|n| G::generator() * vss_sk.eval(n.id).value)
+        let partial_pks = self
+            .share_ids_iter()
+            .map(|i| G::generator() * self.vss_sk.eval(i).value)
             .collect();
         let mut interim_values: Vec<[(G::ScalarType, G); NUM_OF_ENCRYPTIONS_PER_SHARE]> =
             Vec::new();
-        let pairs = nodes
-            .iter()
-            .map(|n| {
+        let pairs = self
+            .share_ids_iter()
+            .map(|i| {
                 let mut values = Vec::new();
+                let node = self.share_id_to_node(i);
                 let encryptions = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
                     .into_iter()
                     .map(|i| {
                         let r = G::ScalarType::rand(rng);
                         let msg = bcs::to_bytes(&r).expect("serialization should work");
                         let r_g = G::generator() * r;
-                        let r_x_g = *n.pk.as_element() * r;
+                        let r_x_g = *node.pk.as_element() * r;
                         // Save also the points instead of recomputing them later.
                         values.push((r, r_x_g));
-                        n.pk.deterministic_encrypt(&msg, &r_g, &r_x_g)
+                        node.pk.deterministic_encrypt(&msg, &r_g, &r_x_g)
                     })
                     .collect::<Vec<_>>()
                     .try_into()
@@ -237,40 +228,46 @@ where
             })
             .collect();
         let msg_before_fiat_shamir = Message {
-            sender: id,
+            sender: self.id,
             encrypted_random_shares: pairs,
             partial_pks,
             processed_encryptions: Vec::new(), // pre fiat-shamir
         };
         // Compute the cut-and-choose challenge bits.
-        let ro = random_oracle.extend(format!("-{}-cut-and-choose", id).as_str());
+        let ro = self
+            .random_oracle
+            .extend(format!("-{}-cut-and-choose", self.id).as_str());
         let seed = ro.evaluate(&msg_before_fiat_shamir);
-        let challenge = Self::challenge(seed.as_slice(), nodes.len() as u32);
+        let challenge = Self::challenge(seed.as_slice(), self.n);
 
         // Reveal the scalars corresponding to the challenge bits.
-        let processed_pairs = izip!(nodes.iter(), challenge.iter(), interim_values.iter())
-            .map(|(node, chal, &values)| {
-                let share = vss_sk.eval(node.id).value;
-                let infos = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
-                    .into_iter()
-                    .map(|i| {
-                        if chal[i] {
-                            EncryptionInfo::ForVerification {
-                                k: values[i].0.clone(),
-                                k_x_g: values[i].1.clone(),
-                            }
-                        } else {
-                            EncryptionInfo::ForEvaluation {
-                                diff: share - values[i].0,
-                            }
+        let processed_pairs = izip!(
+            self.share_ids_iter(),
+            challenge.iter(),
+            interim_values.iter()
+        )
+        .map(|(share_id, chal, &values)| {
+            let share = self.vss_sk.eval(share_id).value;
+            let infos = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
+                .into_iter()
+                .map(|i| {
+                    if chal[i] {
+                        EncryptionInfo::ForVerification {
+                            k: values[i].0.clone(),
+                            k_x_g: values[i].1.clone(),
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .expect("should work");
-                ProcessedEncryptions { infos }
-            })
-            .collect();
+                    } else {
+                        EncryptionInfo::ForEvaluation {
+                            diff: share - values[i].0,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("should work");
+            ProcessedEncryptions { infos }
+        })
+        .collect();
 
         let msg_after = Message {
             processed_encryptions: processed_pairs,
@@ -285,10 +282,9 @@ where
         msg: &Message<G>,
         rng: &mut R,
     ) -> FastCryptoResult<()> {
-        let n = self.n();
         // Check the degree of the sender's polynomial..
         verify_deg_t_poly(
-            n - self.threshold - 1,
+            self.n - self.t - 1,
             &msg.partial_pks,
             &self.precomputed_dual_code_coefficients,
             rng,
@@ -303,41 +299,44 @@ where
             .random_oracle
             .extend(format!("-{}-cut-and-choose", msg.sender).as_str());
         let seed = ro.evaluate(&msg_before_fiat_shamir);
-        let challenge = Self::challenge(seed.as_slice(), n);
+        let challenge = Self::challenge(seed.as_slice(), self.n);
 
         let mut pairs_to_check = Vec::new();
         let mut tuples_to_check = Vec::new();
         let all_ok = izip!(
-            self.nodes.iter(),
+            self.share_ids_iter(),
             msg.encrypted_random_shares.iter(),
             challenge.iter(),
             msg.processed_encryptions.iter(),
             msg.partial_pks.iter()
         )
-        .all(|(node, encryptions, chal, proc_encryptions, partial_pk)| {
-            for i in (0..NUM_OF_ENCRYPTIONS_PER_SHARE) {
-                let enc = &encryptions.values[i];
-                // Some of the checks are verified as a batch below, using MSM.
-                match (chal[i], &proc_encryptions.infos[i]) {
-                    (true, EncryptionInfo::ForVerification { k, k_x_g }) => {
-                        let msg = bcs::to_bytes(&k).expect("serialization should work");
-                        let k_g = enc.ephemeral_key();
-                        if node.pk.deterministic_encrypt(&msg, &k_g, &k_x_g) != *enc {
+        .all(
+            |(share_id, encryptions, chal, proc_encryptions, partial_pk)| {
+                let node = self.share_id_to_node(share_id);
+                for i in (0..NUM_OF_ENCRYPTIONS_PER_SHARE) {
+                    let enc = &encryptions.values[i];
+                    // Some of the checks are verified as a batch below, using MSM.
+                    match (chal[i], &proc_encryptions.infos[i]) {
+                        (true, EncryptionInfo::ForVerification { k, k_x_g }) => {
+                            let msg = bcs::to_bytes(&k).expect("serialization should work");
+                            let k_g = enc.ephemeral_key();
+                            if node.pk.deterministic_encrypt(&msg, &k_g, &k_x_g) != *enc {
+                                return false;
+                            }
+                            pairs_to_check.push((*k, *k_g));
+                            tuples_to_check.push((*k, *node.pk.as_element(), *k_x_g))
+                        }
+                        (false, EncryptionInfo::ForEvaluation { diff }) => {
+                            pairs_to_check.push((*diff, *partial_pk - enc.ephemeral_key()))
+                        }
+                        _ => {
                             return false;
                         }
-                        pairs_to_check.push((*k, *k_g));
-                        tuples_to_check.push((*k, *node.pk.as_element(), *k_x_g))
-                    }
-                    (false, EncryptionInfo::ForEvaluation { diff }) => {
-                        pairs_to_check.push((*diff, *partial_pk - enc.ephemeral_key()))
-                    }
-                    _ => {
-                        return false;
                     }
                 }
-            }
-            return true;
-        });
+                return true;
+            },
+        );
 
         if all_ok {
             // if true {
@@ -351,24 +350,24 @@ where
 
     /// 6. Given enough verified messages, compute the final public keys.
     // TODO: Should fail if not enough messages?
-    pub fn compute_final_pks(&self, messages: &[Message<G>], t: u32) -> (G, Vec<G>) {
+    pub fn compute_final_pks(&self, messages: &[Message<G>]) -> (G, Vec<G>) {
         let mut res = Vec::<G>::with_capacity(messages.len());
         for msg in messages {
             for (i, pk) in msg.partial_pks.iter().enumerate() {
                 res[i] = res[i] + pk;
             }
         }
-
+        // Compute the BLS pk
         let evals = res
             .iter()
-            .take(t as usize)
+            .take(self.t as usize)
             .enumerate()
             .map(|(i, pk)| Eval {
                 index: NonZeroU32::new((i + 1) as u32).expect("non zero"),
                 value: *pk,
             })
             .collect::<Vec<Eval<G>>>();
-        let pk = Poly::<G>::recover_c0(t, &evals).expect("enough shares");
+        let pk = Poly::<G>::recover_c0(self.t, &evals).expect("enough shares");
 
         (pk, res)
     }

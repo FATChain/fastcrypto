@@ -4,7 +4,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 use fastcrypto::groups::bls12381;
 use fastcrypto_tbls::ecies;
-use fastcrypto_tbls::nidkg::{Party, PkiNode};
+use fastcrypto_tbls::nidkg::{Node, Party};
 use fastcrypto_tbls::random_oracle::RandomOracle;
 use fastcrypto_tbls::types::ShareIndex;
 use rand::thread_rng;
@@ -29,7 +29,7 @@ pub fn setup_party(
 ) -> Party<G> {
     let nodes = keys
         .iter()
-        .map(|(id, _sk, pk)| PkiNode::<G> {
+        .map(|(id, _sk, pk)| Node::<G> {
             id: *id,
             pk: pk.clone(),
         })

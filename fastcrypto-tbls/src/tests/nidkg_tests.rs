@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::ecies;
-use crate::nidkg::{Party, PkiNode};
+use crate::nidkg::{Node, Party};
 use crate::random_oracle::RandomOracle;
 use crate::tbls::ThresholdBls;
 use crate::types::{ShareIndex, ThresholdBls12381MinSig};
@@ -15,13 +15,13 @@ const MSG: [u8; 4] = [1, 2, 3, 4];
 
 type G = G2Element;
 
-pub fn gen_ecies_keys(n: usize) -> Vec<(ShareIndex, ecies::PrivateKey<G>, ecies::PublicKey<G>)> {
-    (1..=n)
+pub fn gen_ecies_keys(n: u16) -> Vec<(u16, ecies::PrivateKey<G>, ecies::PublicKey<G>)> {
+    (0..n)
         .into_iter()
         .map(|id| {
             let sk = ecies::PrivateKey::<G>::new(&mut thread_rng());
             let pk = ecies::PublicKey::<G>::from_private_key(&sk);
-            (ShareIndex::new(id as u32).unwrap(), sk, pk)
+            (id, sk, pk)
         })
         .collect()
 }
@@ -29,17 +29,18 @@ pub fn gen_ecies_keys(n: usize) -> Vec<(ShareIndex, ecies::PrivateKey<G>, ecies:
 pub fn setup_party(
     id: usize,
     threshold: u32,
-    keys: &[(ShareIndex, ecies::PrivateKey<G>, ecies::PublicKey<G>)],
+    keys: &[(u16, ecies::PrivateKey<G>, ecies::PublicKey<G>)],
 ) -> Party<G> {
     let nodes = keys
         .iter()
-        .map(|(id, _sk, pk)| PkiNode::<G> {
+        .map(|(id, _sk, pk)| Node::<G> {
             id: *id,
             pk: pk.clone(),
+            weight: 1,
         })
         .collect();
     Party::<G>::new(
-        keys.get(id - 1).unwrap().1.clone(),
+        keys.get(id).unwrap().1.clone(),
         nodes,
         threshold,
         RandomOracle::new("dkg"),
@@ -52,17 +53,17 @@ pub fn setup_party(
 fn test_dkg_e2e_4_parties_threshold_2() {
     let keys = gen_ecies_keys(4);
 
+    let d0 = setup_party(0, 2, &keys);
     let mut d1 = setup_party(1, 2, &keys);
     let d2 = setup_party(2, 2, &keys);
     // The third party is ignored (emulating a byzantine party).
     let _d3 = setup_party(3, 2, &keys);
-    let d4 = setup_party(4, 2, &keys);
 
-    let m1 = d1.msg();
-    let mut m2 = d2.msg();
-    let m4 = d4.msg();
+    let m0 = d0.create_message(&mut thread_rng());
+    let m1 = d1.create_message(&mut thread_rng());
+    let mut m2 = d2.create_message(&mut thread_rng());
 
-    assert!(d4.verify_message(&m1, &mut thread_rng()).is_ok());
+    assert!(d0.verify_message(&m1, &mut thread_rng()).is_ok());
     assert!(d2.verify_message(&m1, &mut thread_rng()).is_ok());
     assert!(d1.verify_message(&m2, &mut thread_rng()).is_ok());
     // TODO: test failure of verify_message
