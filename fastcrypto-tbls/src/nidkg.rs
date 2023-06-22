@@ -59,8 +59,11 @@ pub struct Encryptions<G: GroupElement> {
 #[derive(Clone, Debug, Serialize)]
 enum EncryptionInfo<G: GroupElement> {
     // Let the encryption be (k*G, AES_{hkdf(k*xG)}(k)).
-    ForVerification { k: G::ScalarType, k_x_g: G }, // k_x_g is added to reduce verification time.
-    ForEvaluation { diff: G::ScalarType },          // share - k
+
+    // k_x_g is used instead of k to reduce verification time.
+    ForVerification { k_x_g: G },
+    // share - k
+    ForEvaluation { diff: G::ScalarType },
 }
 
 #[derive(Clone, Serialize)]
@@ -244,7 +247,6 @@ where
                 .map(|i| {
                     if chal[i] {
                         EncryptionInfo::ForVerification {
-                            k: values[i].0.clone(),
                             k_x_g: values[i].1.clone(),
                         }
                     } else {
@@ -308,14 +310,16 @@ where
                     let enc = &encryptions.values[i];
                     // Some of the checks are verified as a batch below, using MSM.
                     match (chal[i], &proc_encryptions.infos[i]) {
-                        (true, EncryptionInfo::ForVerification { k, k_x_g }) => {
-                            let msg = bcs::to_bytes(&k).expect("serialization should work");
-                            let k_g = enc.ephemeral_key();
-                            if node.pk.deterministic_encrypt(&msg, &k_g, &k_x_g) != *enc {
-                                return false;
-                            }
-                            pairs_to_check.push((*k, *k_g));
-                            tuples_to_check.push((*k, *node.pk.as_element(), *k_x_g))
+                        (true, EncryptionInfo::ForVerification { k_x_g }) => {
+                            let msg = enc.decrypt_from_partial_decryption(k_x_g);
+                            let k: G::ScalarType = match bcs::from_bytes(&msg) {
+                                Ok(k) => k,
+                                Err(_) => {
+                                    return false;
+                                }
+                            };
+                            pairs_to_check.push((k, *enc.ephemeral_key()));
+                            tuples_to_check.push((k, *node.pk.as_element(), *k_x_g))
                         }
                         (false, EncryptionInfo::ForEvaluation { diff }) => {
                             pairs_to_check.push((*diff, *partial_pk - enc.ephemeral_key()))
