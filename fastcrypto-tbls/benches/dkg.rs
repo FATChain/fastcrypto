@@ -52,7 +52,7 @@ mod dkg_benches {
 
     fn dkg(c: &mut Criterion) {
         const SIZES: [u16; 1] = [100];
-        const WEIGHTS: [u16; 2] = [20, 33];
+        const WEIGHTS: [u16; 3] = [10, 20, 33];
 
         {
             let mut create: BenchmarkGroup<_> = c.benchmark_group("DKG create");
@@ -79,7 +79,10 @@ mod dkg_benches {
                 println!("Message size: {}", bcs::to_bytes(&message).unwrap().len());
 
                 verify.bench_function(format!("n={}, w={}, t={}", n, w, t).as_str(), |b| {
-                    b.iter(|| d1.process_message(&message, &mut thread_rng()).unwrap())
+                    b.iter(|| {
+                        d1.process_message(message.clone(), &mut thread_rng())
+                            .unwrap()
+                    })
                 });
             }
         }

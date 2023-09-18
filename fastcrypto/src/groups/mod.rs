@@ -4,12 +4,13 @@
 use crate::error::{FastCryptoError, FastCryptoResult};
 use crate::traits::AllowedRng;
 use core::ops::{Add, Div, Mul, Neg, Sub};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::fmt::Debug;
 use std::ops::{AddAssign, SubAssign};
 
 pub mod bls12381;
 pub mod ristretto255;
-
 pub mod secp256r1;
 
 pub mod multiplier;
@@ -47,8 +48,12 @@ pub trait GroupElement:
     }
 }
 
+// TODO: Move Serialize + DeserializeOwned to GroupElement.
+
 /// Trait impl'd by scalars to be used with [GroupElement].
-pub trait Scalar: GroupElement<ScalarType = Self> + Copy + From<u64> + Sized + Debug {
+pub trait Scalar:
+    GroupElement<ScalarType = Self> + Copy + From<u64> + Sized + Debug + Serialize + DeserializeOwned
+{
     fn rand<R: AllowedRng>(rng: &mut R) -> Self;
     fn inverse(&self) -> FastCryptoResult<Self>;
 }
@@ -58,6 +63,13 @@ pub trait Pairing: GroupElement {
     type Output;
 
     fn pairing(&self, other: &Self::Other) -> <Self as Pairing>::Output;
+}
+
+/// Trait for groups that have a reduction from a random buffer to a group element that is secure
+/// when used for Fiat-Shamir. Note that the resulting group element is not guaranteed to be
+/// uniformly distributed, but only to have enough entropy to be used for Fiat-Shamir heuristic.
+pub trait FiatShamirChallenge {
+    fn fiat_shamir_reduction_to_group_element(uniform_buffer: &[u8]) -> Self;
 }
 
 /// Trait for groups that have a standardized "hash_to_point"/"hash_to_curve" function (see

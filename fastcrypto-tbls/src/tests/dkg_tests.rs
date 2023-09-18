@@ -1,7 +1,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::dkg::{Confirmation, Party};
+use crate::dkg::Party;
 use crate::ecies;
 use crate::nodes::{Node, PartyId};
 use crate::random_oracle::RandomOracle;
@@ -10,7 +10,6 @@ use crate::types::ThresholdBls12381MinSig;
 use fastcrypto::groups::bls12381::G2Element;
 use fastcrypto::groups::ristretto255::RistrettoPoint;
 use rand::thread_rng;
-use std::collections::HashMap;
 
 const MSG: [u8; 4] = [1, 2, 3, 4];
 
@@ -37,7 +36,7 @@ fn setup_party(
         .map(|(id, _sk, pk)| Node::<EG> {
             id: *id,
             pk: pk.clone(),
-            weight: 1,
+            weight: 2,
         })
         .collect();
     Party::<G, EG>::new(
@@ -74,49 +73,34 @@ fn test_dkg_e2e_4_parties_threshold_2() {
     let _msg3 = d3.create_message(&mut thread_rng());
     let r1_all = vec![msg0, msg1];
 
-    let (shares0, conf0) = r1_all
-        .iter()
-        .map(|m| d0.process_message(m, &mut thread_rng()).unwrap())
-        .fold(
-            (
-                HashMap::new(),
-                Confirmation {
-                    sender: 0,
-                    complaints: Vec::new(),
-                },
-            ),
-            |acc, x| d0.merge(&[acc, x]),
-        );
+    let (shares0, conf0) = d0
+        .merge(
+            &r1_all
+                .iter()
+                .map(|m| d0.process_message(m.clone(), &mut thread_rng()).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
-    let (shares1, conf1) = r1_all
-        .iter()
-        .map(|m| d1.process_message(m, &mut thread_rng()).unwrap())
-        .fold(
-            (
-                HashMap::new(),
-                Confirmation {
-                    sender: 1,
-                    complaints: Vec::new(),
-                },
-            ),
-            |acc, x| d1.merge(&[acc, x]),
-        );
+    let (shares1, conf1) = d1
+        .merge(
+            &r1_all
+                .iter()
+                .map(|m| d1.process_message(m.clone(), &mut thread_rng()).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
     // Note that d3's first round message is not included but it should still be able to receive
     // shares and post complaints.
-    let (shares3, conf3) = r1_all
-        .iter()
-        .map(|m| d3.process_message(m, &mut thread_rng()).unwrap())
-        .fold(
-            (
-                HashMap::new(),
-                Confirmation {
-                    sender: 3,
-                    complaints: Vec::new(),
-                },
-            ),
-            |acc, x| d3.merge(&[acc, x]),
-        );
+    let (shares3, conf3) = d3
+        .merge(
+            &r1_all
+                .iter()
+                .map(|m| d3.process_message(m.clone(), &mut thread_rng()).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
     // There should be some complaints on the first messages of d1.
     assert!(
@@ -131,13 +115,13 @@ fn test_dkg_e2e_4_parties_threshold_2() {
 
     let r2_all = vec![conf0, conf1, conf3];
     let shares0 = d1
-        .process_confirmations(&r1_all, &r2_all, shares0, 3)
+        .process_confirmations(&r1_all, &r2_all, shares0, 3, &mut thread_rng())
         .unwrap();
     let shares1 = d1
-        .process_confirmations(&r1_all, &r2_all, shares1, 3)
+        .process_confirmations(&r1_all, &r2_all, shares1, 3, &mut thread_rng())
         .unwrap();
     let shares3 = d3
-        .process_confirmations(&r1_all, &r2_all, shares3, 3)
+        .process_confirmations(&r1_all, &r2_all, shares3, 3, &mut thread_rng())
         .unwrap();
 
     // Only the first message of d0 passed all tests -> only one vss is used.

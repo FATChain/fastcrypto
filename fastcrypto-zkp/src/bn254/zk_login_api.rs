@@ -43,7 +43,8 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
         "20491192805390485299153009773594534940189261866228447918068658471970481763042".to_string(),
         "9383485363053290200918347156157836566562967994039712273449902621266178545958".to_string(),
         "1".to_string(),
-    ]);
+    ])
+    .unwrap();
     let vk_beta_2 = g2_affine_from_str_projective(vec![
         vec![
             "6375614351688725206403948262868962793625744043794305715222011528459656738731"
@@ -58,7 +59,8 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
     let vk_gamma_2 = g2_affine_from_str_projective(vec![
         vec![
             "10857046999023057135944570762232829481370756359578518086990519993285655852781"
@@ -73,7 +75,8 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
     let vk_delta_2 = g2_affine_from_str_projective(vec![
         vec![
             "10857046999023057135944570762232829481370756359578518086990519993285655852781"
@@ -88,11 +91,12 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
 
     // Create a vector of G1Affine elements from the IC
     let mut vk_gamma_abc_g1 = Vec::new();
-    for e in vec![
+    for e in [
         vec![
             "18931764958316061396537365316410279129357566768168194299771466990652581507745"
                 .to_string(),
@@ -108,7 +112,7 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
             "1".to_string(),
         ],
     ] {
-        let g1 = g1_affine_from_str_projective(e);
+        let g1 = g1_affine_from_str_projective(e).unwrap();
         vk_gamma_abc_g1.push(g1);
     }
 
@@ -124,14 +128,15 @@ fn random_pvk() -> PreparedVerifyingKey<Bn254> {
     process_vk_special(&Bn254VerifyingKey(vk)).as_arkworks_pvk()
 }
 
-/// Load a fixed verifying key from zklogin.vkey output. This is based on a local setup and should not use in production.
+/// Load a fixed verifying key from zkLogin.vkey output. This is based on a local setup and should not use in production.
 fn global_pvk() -> PreparedVerifyingKey<Bn254> {
     // Convert the Circom G1/G2/GT to arkworks G1/G2/GT
     let vk_alpha_1 = g1_affine_from_str_projective(vec![
         "20491192805390485299153009773594534940189261866228447918068658471970481763042".to_string(),
         "9383485363053290200918347156157836566562967994039712273449902621266178545958".to_string(),
         "1".to_string(),
-    ]);
+    ])
+    .unwrap();
     let vk_beta_2 = g2_affine_from_str_projective(vec![
         vec![
             "6375614351688725206403948262868962793625744043794305715222011528459656738731"
@@ -146,7 +151,8 @@ fn global_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
     let vk_gamma_2 = g2_affine_from_str_projective(vec![
         vec![
             "10857046999023057135944570762232829481370756359578518086990519993285655852781"
@@ -161,7 +167,8 @@ fn global_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
     let vk_delta_2 = g2_affine_from_str_projective(vec![
         vec![
             "10857046999023057135944570762232829481370756359578518086990519993285655852781"
@@ -176,27 +183,28 @@ fn global_pvk() -> PreparedVerifyingKey<Bn254> {
                 .to_string(),
         ],
         vec!["1".to_string(), "0".to_string()],
-    ]);
+    ])
+    .unwrap();
 
     // Create a vector of G1Affine elements from the IC
     let mut vk_gamma_abc_g1 = Vec::new();
     for e in vec![
         vec![
-            "7867381425847202568112484563431973323103411930691887303954018406238548242435"
+            "20701306374481714853949730154526815782802808896228594855451770849676897643964"
                 .to_string(),
-            "9248741518501530047280522988482444540196070811288498251337804330766153222468"
+            "2766989084754673216772682210231588284954002353414778477810174100808747060165"
                 .to_string(),
             "1".to_string(),
         ],
         vec![
-            "6921103582886817463237640768843495630434715149818209746147837519636936148422"
+            "501195541410525737371980194958674422793469475773065719916327137354779402600"
                 .to_string(),
-            "322734211400980047302715221807873863996954295847288894748430574151699272036"
+            "13527631693157515024233848630878973193664410306029731429350155106228769355415"
                 .to_string(),
             "1".to_string(),
         ],
     ] {
-        let g1 = g1_affine_from_str_projective(e);
+        let g1 = g1_affine_from_str_projective(e).unwrap();
         vk_gamma_abc_g1.push(g1);
     }
 
@@ -236,8 +244,8 @@ pub fn verify_zk_login(
     // Calculat all inputs hash and passed to the verification function.
     match verify_zk_login_proof_with_fixed_vk(
         env,
-        &input.get_proof().as_arkworks(),
-        &input.calculate_all_inputs_hash(eph_pubkey_bytes, &modulus, max_epoch)?,
+        &input.get_proof().as_arkworks()?,
+        &[input.calculate_all_inputs_hash(eph_pubkey_bytes, &modulus, max_epoch)?],
     ) {
         Ok(true) => Ok(()),
         Ok(false) | Err(_) => Err(FastCryptoError::GeneralError(
