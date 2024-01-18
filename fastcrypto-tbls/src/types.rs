@@ -3,7 +3,7 @@
 
 use crate::polynomial::{Eval, PublicPoly};
 use crate::{ecies, tbls};
-use fastcrypto::error::FastCryptoError;
+use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::ristretto255::RistrettoPoint;
 use fastcrypto::groups::{bls12381, GroupElement, HashToGroupElement, Pairing};
 use serde::{Deserialize, Serialize};
@@ -18,11 +18,7 @@ impl tbls::ThresholdBls for ThresholdBls12381MinSig {
     type Public = bls12381::G2Element;
     type Signature = bls12381::G1Element;
 
-    fn verify_pairings(
-        pk: &Self::Public,
-        sig: &Self::Signature,
-        msg: &[u8],
-    ) -> Result<(), FastCryptoError> {
+    fn verify(pk: &Self::Public, msg: &[u8], sig: &Self::Signature) -> FastCryptoResult<()> {
         let hashed_message = Self::Signature::hash_to_group_element(msg);
         // e(sig, g2)
         let left = sig.pairing(&Self::Public::generator());

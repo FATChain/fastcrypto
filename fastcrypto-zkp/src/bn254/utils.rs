@@ -1,7 +1,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::bn254::poseidon::PoseidonWrapper;
+use crate::bn254::poseidon::poseidon_zk_login;
 use crate::bn254::zk_login::{OIDCProvider, ZkLoginInputsReader};
 use crate::bn254::zk_login_api::Bn254Fr;
 use fastcrypto::error::FastCryptoError;
@@ -17,8 +17,6 @@ use std::str::FromStr;
 use super::zk_login::{hash_ascii_str_to_field, to_field};
 
 const ZK_LOGIN_AUTHENTICATOR_FLAG: u8 = 0x05;
-const SALT_SERVER_URL: &str = "http://salt.api-devnet.mystenlabs.com/get_salt";
-const PROVER_SERVER_URL: &str = "http://185.209.177.123:7000/zkp";
 const MAX_KEY_CLAIM_NAME_LENGTH: u8 = 32;
 const MAX_KEY_CLAIM_VALUE_LENGTH: u8 = 115;
 const MAX_AUD_VALUE_LENGTH: u8 = 145;
@@ -41,15 +39,24 @@ pub fn gen_address_seed(
     value: &str, // i.e. the sub value
     aud: &str,   // i.e. the client ID
 ) -> Result<String, FastCryptoError> {
-    let poseidon = PoseidonWrapper::new();
-    Ok(poseidon
-        .hash(vec![
-            hash_ascii_str_to_field(name, MAX_KEY_CLAIM_NAME_LENGTH)?,
-            hash_ascii_str_to_field(value, MAX_KEY_CLAIM_VALUE_LENGTH)?,
-            hash_ascii_str_to_field(aud, MAX_AUD_VALUE_LENGTH)?,
-            poseidon.hash(vec![to_field(salt)?])?,
-        ])?
-        .to_string())
+    let salt_hash = poseidon_zk_login(vec![to_field(salt)?])?;
+    gen_address_seed_with_salt_hash(&salt_hash.to_string(), name, value, aud)
+}
+
+/// Same as [`gen_address_seed`] but takes the poseidon hash of the salt as input instead of the salt.
+pub(crate) fn gen_address_seed_with_salt_hash(
+    salt_hash: &str,
+    name: &str,  // i.e. "sub"
+    value: &str, // i.e. the sub value
+    aud: &str,   // i.e. the client ID
+) -> Result<String, FastCryptoError> {
+    Ok(poseidon_zk_login(vec![
+        hash_ascii_str_to_field(name, MAX_KEY_CLAIM_NAME_LENGTH)?,
+        hash_ascii_str_to_field(value, MAX_KEY_CLAIM_VALUE_LENGTH)?,
+        hash_ascii_str_to_field(aud, MAX_AUD_VALUE_LENGTH)?,
+        to_field(salt_hash)?,
+    ])?
+    .to_string())
 }
 
 /// Return the OIDC URL for the given parameters. Crucially the nonce is computed.
@@ -65,7 +72,26 @@ pub fn get_oidc_url(
     Ok(match provider {
             OIDCProvider::Google => format!("https://accounts.google.com/o/oauth2/v2/auth?client_id={}&response_type=id_token&redirect_uri={}&scope=openid&nonce={}", client_id, redirect_url, nonce),
             OIDCProvider::Twitch => format!("https://id.twitch.tv/oauth2/authorize?client_id={}&force_verify=true&lang=en&login_type=login&redirect_uri={}&response_type=id_token&scope=openid&nonce={}", client_id, redirect_url, nonce),
-            OIDCProvider::Facebook => format!("https://www.facebook.com/v17.0/dialog/oauth?client_id={}&redirect_uri={}&scope=openid&nonce={}&response_type=id_token", client_id, redirect_url, nonce) })
+            OIDCProvider::Facebook => format!("https://www.facebook.com/v17.0/dialog/oauth?client_id={}&redirect_uri={}&scope=openid&nonce={}&response_type=id_token", client_id, redirect_url, nonce),
+            OIDCProvider::Kakao => format!("https://kauth.kakao.com/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&nonce={}", client_id, redirect_url, nonce),
+            OIDCProvider::Apple => format!("https://appleid.apple.com/auth/authorize?client_id={}&redirect_uri={}&scope=email&response_mode=form_post&response_type=code%20id_token&nonce={}", client_id, redirect_url, nonce),
+            OIDCProvider::Slack => format!("https://slack.com/openid/connect/authorize?response_type=code&client_id={}&redirect_uri={}&nonce={}&scope=openid", client_id, redirect_url, nonce) 
+        })
+}
+
+/// Return the token exchange URL for the given auth code.
+pub fn get_token_exchange_url(
+    provider: OIDCProvider,
+    client_id: &str,
+    redirect_url: &str, // not required for Slack, pass in empty string.
+    auth_code: &str,
+    client_secret: &str, // not required for Kakao, pass in empty string.
+) -> Result<String, FastCryptoError> {
+    match provider {
+        OIDCProvider::Kakao => Ok(format!("https://kauth.kakao.com/oauth/token?grant_type=authorization_code&client_id={}&redirect_uri={}&code={}", client_id, redirect_url, auth_code)),
+        OIDCProvider::Slack => Ok(format!("https://slack.com/api/openid.connect.token?code={}&client_id={}&client_secret={}", auth_code, client_id, client_secret)),
+        _ => Err(FastCryptoError::InvalidInput)
+    }
 }
 
 /// Calculate the nonce for the given parameters. Nonce is defined as the Base64Url encoded of the poseidon hash of 4 inputs:
@@ -75,7 +101,6 @@ pub fn get_nonce(
     max_epoch: u64,
     jwt_randomness: &str,
 ) -> Result<String, FastCryptoError> {
-    let poseidon = PoseidonWrapper::new();
     let (first, second) = split_to_two_frs(eph_pk_bytes)?;
 
     let max_epoch = Bn254Fr::from_str(&max_epoch.to_string())
@@ -83,8 +108,7 @@ pub fn get_nonce(
     let jwt_randomness =
         Bn254Fr::from_str(jwt_randomness).map_err(|_| FastCryptoError::InvalidInput)?;
 
-    let hash = poseidon
-        .hash(vec![first, second, max_epoch, jwt_randomness])
+    let hash = poseidon_zk_login(vec![first, second, max_epoch, jwt_randomness])
         .expect("inputs is not too long");
     let data = BigUint::from(hash).to_bytes_be();
     let truncated = &data[data.len() - 20..];
@@ -102,11 +126,11 @@ pub struct GetSaltResponse {
 }
 
 /// Call the salt server for the given jwt_token and return the salt.
-pub async fn get_salt(jwt_token: &str) -> Result<String, FastCryptoError> {
+pub async fn get_salt(jwt_token: &str, salt_url: &str) -> Result<String, FastCryptoError> {
     let client = Client::new();
     let body = json!({ "token": jwt_token });
     let response = client
-        .post(SALT_SERVER_URL)
+        .post(salt_url)
         .json(&body)
         .header("Content-Type", "application/json")
         .send()
@@ -128,18 +152,19 @@ pub async fn get_proof(
     jwt_randomness: &str,
     eph_pubkey: &str,
     salt: &str,
+    prover_url: &str,
 ) -> Result<ZkLoginInputsReader, FastCryptoError> {
     let body = json!({
-    "jwt": jwt_token,
-    "extendedEphemeralPublicKey": eph_pubkey,
-    "maxEpoch": max_epoch,
-    "jwtRandomness": jwt_randomness,
-    "salt": salt,
-    "keyClaimName": "sub",
+        "jwt": jwt_token,
+        "extendedEphemeralPublicKey": eph_pubkey,
+        "maxEpoch": max_epoch,
+        "jwtRandomness": jwt_randomness,
+        "salt": salt,
+        "keyClaimName": "sub",
     });
     let client = Client::new();
     let response = client
-        .post(PROVER_SERVER_URL.to_string())
+        .post(prover_url.to_string())
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -149,6 +174,10 @@ pub async fn get_proof(
         .bytes()
         .await
         .map_err(|_| FastCryptoError::InvalidInput)?;
+
+    #[cfg(feature = "e2e")]
+    println!("get_proof response: {:?}", full_bytes);
+
     let get_proof_response: ZkLoginInputsReader =
         serde_json::from_slice(&full_bytes).map_err(|_| FastCryptoError::InvalidInput)?;
     Ok(get_proof_response)

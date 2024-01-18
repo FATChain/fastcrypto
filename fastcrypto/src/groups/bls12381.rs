@@ -3,6 +3,7 @@
 
 use crate::bls12381::min_pk::DST_G2;
 use crate::bls12381::min_sig::DST_G1;
+use crate::encoding::{Encoding, Hex};
 use crate::error::{FastCryptoError, FastCryptoResult};
 use crate::groups::{
     FiatShamirChallenge, GroupElement, HashToGroupElement, MultiScalarMul, Pairing,
@@ -19,42 +20,45 @@ use blst::{
     blst_fr_from_scalar, blst_fr_from_uint64, blst_fr_inverse, blst_fr_mul, blst_fr_rshift,
     blst_fr_sub, blst_hash_to_g1, blst_hash_to_g2, blst_lendian_from_scalar, blst_miller_loop,
     blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_cneg, blst_p1_compress,
-    blst_p1_deserialize, blst_p1_from_affine, blst_p1_in_g1, blst_p1_mult, blst_p1_to_affine,
+    blst_p1_from_affine, blst_p1_in_g1, blst_p1_mult, blst_p1_to_affine, blst_p1_uncompress,
     blst_p2, blst_p2_add_or_double, blst_p2_affine, blst_p2_cneg, blst_p2_compress,
-    blst_p2_deserialize, blst_p2_from_affine, blst_p2_in_g2, blst_p2_mult, blst_p2_to_affine,
-    blst_scalar, blst_scalar_fr_check, blst_scalar_from_bendian, blst_scalar_from_fr, p1_affines,
-    p2_affines, BLS12_381_G1, BLS12_381_G2, BLST_ERROR,
+    blst_p2_from_affine, blst_p2_in_g2, blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress,
+    blst_scalar, blst_scalar_fr_check, blst_scalar_from_be_bytes, blst_scalar_from_bendian,
+    blst_scalar_from_fr, p1_affines, p2_affines, BLS12_381_G1, BLS12_381_G2, BLST_ERROR,
 };
 use derive_more::From;
 use fastcrypto_derive::GroupOpsExtend;
+use hex_literal::hex;
 use once_cell::sync::OnceCell;
 use serde::{de, Deserialize};
+use std::fmt::Debug;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::ptr;
 
 /// Elements of the group G_1 in BLS 12-381.
-#[derive(Debug, From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
+#[derive(From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
 #[repr(transparent)]
 pub struct G1Element(blst_p1);
 
 /// Elements of the group G_2 in BLS 12-381.
-#[derive(Debug, From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
+#[derive(From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
 #[repr(transparent)]
 pub struct G2Element(blst_p2);
 
 /// Elements of the subgroup G_T of F_q^{12} in BLS 12-381. Note that it is written in additive notation here.
-#[derive(Debug, From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
+#[derive(From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
 pub struct GTElement(blst_fp12);
 
 /// This represents a scalar modulo r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 /// which is the order of the groups G1, G2 and GT. Note that r is a 255 bit prime.
-#[derive(Debug, From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
+#[derive(From, Clone, Copy, Eq, PartialEq, GroupOpsExtend)]
 pub struct Scalar(blst_fr);
 
 pub const SCALAR_LENGTH: usize = 32;
 pub const G1_ELEMENT_BYTE_LENGTH: usize = 48;
 pub const G2_ELEMENT_BYTE_LENGTH: usize = 96;
 pub const GT_ELEMENT_BYTE_LENGTH: usize = 576;
+pub const FP_BYTE_LENGTH: usize = 48;
 
 impl Add for G1Element {
     type Output = Self;
@@ -91,6 +95,7 @@ impl Neg for G1Element {
 /// The size of this scalar in bytes.
 fn size_in_bytes(scalar: &blst_scalar) -> usize {
     let mut i = scalar.b.len();
+    assert_eq!(i, 32);
     while i != 0 && scalar.b[i - 1] == 0 {
         i -= 1;
     }
@@ -100,7 +105,11 @@ fn size_in_bytes(scalar: &blst_scalar) -> usize {
 /// Given a scalar and its size in bytes (computed using [size_in_bytes], this method returns the size
 /// of the scalar in bits.
 fn size_in_bits(scalar: &blst_scalar, size_in_bytes: usize) -> usize {
-    8 * size_in_bytes - 7 + log2_byte(scalar.b[size_in_bytes - 1])
+    if size_in_bytes == 0 {
+        0
+    } else {
+        8 * size_in_bytes - 7 + log2_byte(scalar.b[size_in_bytes - 1])
+    }
 }
 
 #[allow(clippy::suspicious_arithmetic_impl)]
@@ -153,8 +162,7 @@ impl MultiScalarMul for G1Element {
             return Err(FastCryptoError::InvalidInput);
         }
         // Inspired by blstrs.
-        let points =
-            unsafe { std::slice::from_raw_parts(points.as_ptr() as *const blst_p1, points.len()) };
+        let points = to_blst_type_slice(points);
         let points = p1_affines::from(points);
         let mut scalar_bytes: Vec<u8> = Vec::with_capacity(scalars.len() * 32);
         for a in scalars.iter().map(|s| s.0) {
@@ -164,9 +172,18 @@ impl MultiScalarMul for G1Element {
             }
             scalar_bytes.extend_from_slice(&scalar.b);
         }
+        // The scalar field size is smaller than 2^255, so we need at most 255 bits.
         let res = points.mult(scalar_bytes.as_slice(), 255);
         Ok(Self::from(res))
     }
+}
+
+// Bound the lifetime of points to the output slice.
+fn to_blst_type_slice<From, To>(points: &[From]) -> &[To] {
+    // SAFETY: the cast from `&[G1Element]` to `&[blst_p1]` is safe because
+    // G1Element is a transparent wrapper around blst_p1. The lifetime of
+    // output slice is the same as the input slice.
+    unsafe { std::slice::from_raw_parts(points.as_ptr() as *const To, points.len()) }
 }
 
 impl GroupElement for G1Element {
@@ -226,7 +243,7 @@ impl ToFromByteArray<G1_ELEMENT_BYTE_LENGTH> for G1Element {
         let mut ret = blst_p1::default();
         unsafe {
             let mut affine = blst_p1_affine::default();
-            if blst_p1_deserialize(&mut affine, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS {
+            if blst_p1_uncompress(&mut affine, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS {
                 return Err(FastCryptoError::InvalidInput);
             }
             blst_p1_from_affine(&mut ret, &affine);
@@ -244,6 +261,13 @@ impl ToFromByteArray<G1_ELEMENT_BYTE_LENGTH> for G1Element {
             blst_p1_compress(bytes.as_mut_ptr(), &self.0);
         }
         bytes
+    }
+}
+
+impl Debug for G1Element {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = Hex::encode(self.to_byte_array());
+        write!(f, "{:?}", bytes)
     }
 }
 
@@ -333,8 +357,7 @@ impl MultiScalarMul for G2Element {
             return Err(FastCryptoError::InvalidInput);
         }
         // Inspired by blstrs.
-        let points =
-            unsafe { std::slice::from_raw_parts(points.as_ptr() as *const blst_p2, points.len()) };
+        let points = to_blst_type_slice(points);
         let points = p2_affines::from(points);
         let mut scalar_bytes: Vec<u8> = Vec::with_capacity(scalars.len() * 32);
         for a in scalars.iter().map(|s| s.0) {
@@ -344,6 +367,7 @@ impl MultiScalarMul for G2Element {
             }
             scalar_bytes.extend_from_slice(&scalar.b);
         }
+        // The scalar field size is smaller than 2^255, so we need at most 255 bits.
         let res = points.mult(scalar_bytes.as_slice(), 255);
         Ok(Self::from(res))
     }
@@ -388,7 +412,7 @@ impl ToFromByteArray<G2_ELEMENT_BYTE_LENGTH> for G2Element {
         let mut ret = blst_p2::default();
         unsafe {
             let mut affine = blst_p2_affine::default();
-            if blst_p2_deserialize(&mut affine, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS {
+            if blst_p2_uncompress(&mut affine, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS {
                 return Err(FastCryptoError::InvalidInput);
             }
             blst_p2_from_affine(&mut ret, &affine);
@@ -406,6 +430,13 @@ impl ToFromByteArray<G2_ELEMENT_BYTE_LENGTH> for G2Element {
             blst_p2_compress(bytes.as_mut_ptr(), &self.0);
         }
         bytes
+    }
+}
+
+impl Debug for G2Element {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = Hex::encode(self.to_byte_array());
+        write!(f, "{:?}", bytes)
     }
 }
 
@@ -512,6 +543,8 @@ impl GTElement {
     }
 }
 
+const P_AS_BYTES: [u8; FP_BYTE_LENGTH] = hex!("1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab");
+
 // Note that the serialization below is uncompressed, i.e. it uses 576 bytes.
 impl ToFromByteArray<GT_ELEMENT_BYTE_LENGTH> for GTElement {
     fn from_byte_array(bytes: &[u8; GT_ELEMENT_BYTE_LENGTH]) -> Result<Self, FastCryptoError> {
@@ -523,14 +556,21 @@ impl ToFromByteArray<GT_ELEMENT_BYTE_LENGTH> for GTElement {
             for j in 0..2 {
                 for k in 0..2 {
                     let mut fp = blst_fp::default();
+                    let slice = &bytes[current..current + FP_BYTE_LENGTH];
+                    // We compare with P_AS_BYTES to ensure that we process a canonical representation
+                    // which is uses mod p elements.
+                    if *slice >= P_AS_BYTES[..] {
+                        return Err(FastCryptoError::InvalidInput);
+                    }
                     unsafe {
-                        blst_fp_from_bendian(&mut fp, bytes[current..current + 48].as_ptr());
+                        blst_fp_from_bendian(&mut fp, slice.as_ptr());
                     }
                     gt.fp6[j].fp2[i].fp[k] = fp;
-                    current += 48;
+                    current += FP_BYTE_LENGTH;
                 }
             }
         }
+
         match gt.in_group() {
             true => Ok(Self::from(gt)),
             false => Err(FastCryptoError::InvalidInput),
@@ -539,6 +579,13 @@ impl ToFromByteArray<GT_ELEMENT_BYTE_LENGTH> for GTElement {
 
     fn to_byte_array(&self) -> [u8; GT_ELEMENT_BYTE_LENGTH] {
         self.0.to_bendian()
+    }
+}
+
+impl Debug for GTElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = Hex::encode(self.to_byte_array());
+        write!(f, "{:?}", bytes)
     }
 }
 
@@ -607,8 +654,9 @@ impl Mul<Scalar> for Scalar {
 impl From<u64> for Scalar {
     fn from(value: u64) -> Self {
         let mut ret = blst_fr::default();
+        let buff = [value, 0u64, 0u64, 0u64];
         unsafe {
-            blst_fr_from_uint64(&mut ret, &value);
+            blst_fr_from_uint64(&mut ret, buff.as_ptr());
         }
         Self::from(ret)
     }
@@ -626,15 +674,9 @@ impl Div<Scalar> for Scalar {
 
 impl ScalarType for Scalar {
     fn rand<R: AllowedRng>(rng: &mut R) -> Self {
-        let mut ret = blst_fr::default();
-        let mut bytes = [0u8; SCALAR_LENGTH];
-        rng.fill_bytes(&mut bytes);
-        unsafe {
-            let mut scalar = blst_scalar::default();
-            blst_scalar_from_bendian(&mut scalar, bytes.as_ptr());
-            blst_fr_from_scalar(&mut ret, &scalar);
-        }
-        Scalar::from(ret)
+        let mut buffer = [0u8; 64];
+        rng.fill_bytes(&mut buffer);
+        reduce_mod_uniform_buffer(&buffer)
     }
 
     fn inverse(&self) -> FastCryptoResult<Self> {
@@ -649,19 +691,26 @@ impl ScalarType for Scalar {
     }
 }
 
+/// Reduce a big-endian integer of arbitrary size modulo the scalar field size and return the scalar.
+/// If the input bytes are uniformly distributed, the output will be uniformly distributed in the
+/// scalar field.
+///
+/// The input buffer must be at least 48 bytes long to ensure that there is only negligible bias in
+/// the output.
+pub(crate) fn reduce_mod_uniform_buffer(buffer: &[u8]) -> Scalar {
+    assert!(buffer.len() >= 48);
+    let mut ret = blst_fr::default();
+    let mut tmp = blst_scalar::default();
+    unsafe {
+        blst_scalar_from_be_bytes(&mut tmp, buffer.as_ptr(), buffer.len());
+        blst_fr_from_scalar(&mut ret, &tmp);
+    }
+    Scalar::from(ret)
+}
+
 impl FiatShamirChallenge for Scalar {
     fn fiat_shamir_reduction_to_group_element(uniform_buffer: &[u8]) -> Self {
-        const INPUT_LENGTH: usize = SCALAR_LENGTH - 10; // Safe for our prime field
-        assert!(INPUT_LENGTH >= uniform_buffer.len());
-        let mut bytes = [0u8; INPUT_LENGTH];
-        bytes.copy_from_slice(&uniform_buffer[..INPUT_LENGTH]);
-        let mut ret = blst_fr::default();
-        unsafe {
-            let mut scalar = blst_scalar::default();
-            blst_scalar_from_bendian(&mut scalar, bytes.as_ptr());
-            blst_fr_from_scalar(&mut ret, &scalar);
-        }
-        Scalar::from(ret)
+        reduce_mod_uniform_buffer(uniform_buffer)
     }
 }
 
@@ -687,6 +736,13 @@ impl ToFromByteArray<SCALAR_LENGTH> for Scalar {
             blst_bendian_from_scalar(bytes.as_mut_ptr(), &scalar);
         }
         bytes
+    }
+}
+
+impl Debug for Scalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = Hex::encode(self.to_byte_array());
+        write!(f, "{:?}", bytes)
     }
 }
 

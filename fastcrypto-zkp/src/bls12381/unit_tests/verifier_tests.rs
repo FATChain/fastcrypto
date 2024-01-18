@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::bls12381::verifier::{BlsFr, PreparedVerifyingKey as CustomPVK};
 use ark_bls12_381::{Bls12_381, Fq12, Fr, G1Projective};
-use ark_crypto_primitives::snark::SNARK;
 use ark_ec::bls12::G1Prepared;
 use ark_ec::pairing::Pairing as _;
 use ark_ec::CurveGroup;
 use ark_ff::{One, UniformRand};
 use ark_groth16::{Groth16, PreparedVerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_snark::SNARK;
 use ark_std::rand::thread_rng;
 use blst::{
     blst_final_exp, blst_fp12, blst_fp12_mul, blst_fr, blst_miller_loop, blst_p1, blst_p1_affine,
@@ -26,10 +26,7 @@ use crate::{
         bls_g2_affine_to_blst_g2_affine, blst_fp12_to_bls_fq12,
         tests::{arb_bls_fr, arb_bls_g1_affine, arb_blst_g1_affine, arb_blst_g2_affine},
     },
-    bls12381::verifier::{
-        g1_linear_combination, multipairing_with_processed_vk, process_vk_special,
-        verify_with_processed_vk, BLST_FR_ONE,
-    },
+    bls12381::verifier::{g1_linear_combination, multipairing_with_processed_vk, BLST_FR_ONE},
     dummy_circuits::DummyCircuit,
 };
 
@@ -192,8 +189,8 @@ fn test_verify_with_processed_vk() {
     let proof = Groth16::<Bls12_381>::prove(&pk, c, rng).unwrap().into();
     let v = c.a.unwrap().mul(c.b.unwrap());
 
-    let blst_pvk = process_vk_special(&vk.into());
-    assert!(verify_with_processed_vk(&blst_pvk, &[v.into()], &proof).unwrap());
+    let blst_pvk = CustomPVK::from(&vk.into());
+    assert!(blst_pvk.verify(&[v.into()], &proof).unwrap());
 
     // Roundtrip serde of the proof public input bytes.
     let mut public_inputs_bytes = Vec::new();
@@ -215,21 +212,12 @@ fn test_verify_with_processed_vk() {
             .into();
 
     // Roundtrip serde of the prepared verifying key.
-    let serialized = blst_pvk.as_serialized().unwrap();
-    let serialized_pvk = CustomPVK::deserialize(
-        &serialized[0],
-        &serialized[1],
-        &serialized[2],
-        &serialized[3],
-    )
-    .unwrap();
+    let serialized = blst_pvk.serialize().unwrap();
+    let serialized_pvk = CustomPVK::deserialize(&serialized).unwrap();
 
-    assert!(verify_with_processed_vk(
-        &serialized_pvk,
-        &[deserialized_public_inputs],
-        &deserialized_proof_points
-    )
-    .unwrap());
+    assert!(serialized_pvk
+        .verify(&[deserialized_public_inputs], &deserialized_proof_points)
+        .unwrap());
 }
 
 #[test]
@@ -248,7 +236,7 @@ fn test_multipairing_with_processed_vk() {
     let v = c.a.unwrap().mul(c.b.unwrap());
 
     let ark_pvk = Groth16::<Bls12_381>::process_vk(&vk).unwrap();
-    let blst_pvk = process_vk_special(&vk.into());
+    let blst_pvk = CustomPVK::from(&vk.into());
 
     let ark_fe = ark_multipairing_with_prepared_vk(&ark_pvk, &proof, &[v]);
     let blst_fe = multipairing_with_processed_vk(&blst_pvk, &[v], &proof);

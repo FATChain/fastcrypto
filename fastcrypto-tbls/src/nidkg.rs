@@ -6,7 +6,7 @@ use crate::dl_verification::{
     verify_deg_t_poly, verify_equal_exponents, verify_pairs, verify_triplets,
 };
 use crate::ecies;
-use crate::ecies::RecoveryPackage;
+use crate::ecies::{PublicKey, RecoveryPackage};
 use crate::nodes::{Node, Nodes, PartyId};
 use crate::polynomial::{Eval, Poly, PrivatePoly};
 use crate::random_oracle::RandomOracle;
@@ -105,7 +105,7 @@ where
             .ok_or(FastCryptoError::InvalidInput)?
             .id;
         let nodes = Nodes::new(nodes)?;
-        let n = nodes.n();
+        let n = nodes.total_weight();
         if t >= n {
             return Err(FastCryptoError::InvalidInput);
         }
@@ -113,14 +113,11 @@ where
 
         // Precompute the dual code coefficients.
         let ids_as_scalars = (1..=n)
-            .into_iter()
             .map(|i| (i, G::ScalarType::from(i as u64)))
             .collect::<HashMap<_, _>>();
         let precomputed_dual_code_coefficients = (1..=n)
-            .into_iter()
             .map(|i| {
                 (1..=n)
-                    .into_iter()
                     .filter(|j| i != *j)
                     .map(|j| ids_as_scalars[&i] - ids_as_scalars[&j])
                     .fold(G::ScalarType::generator(), |acc, x| acc * x)
@@ -160,7 +157,6 @@ where
                     .share_id_to_node(&share_id)
                     .expect("using valid share id");
                 let encryptions = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
-                    .into_iter()
                     .map(|_| {
                         let r = G::ScalarType::rand(rng);
                         let msg = bcs::to_bytes(&r).expect("serialization should work");
@@ -168,7 +164,7 @@ where
                         let r_x_g = *node.pk.as_element() * r;
                         // Save also the points instead of recomputing them later.
                         values.push((r, r_x_g));
-                        node.pk.deterministic_encrypt(&msg, &r_g, &r_x_g)
+                        PublicKey::deterministic_encrypt(&msg, &r_g, &r_x_g)
                     })
                     .collect::<Vec<_>>()
                     .try_into()
@@ -188,9 +184,9 @@ where
         // Compute the cut-and-choose challenge bits.
         let ro = self
             .random_oracle
-            .extend(format!("-{}-cut-and-choose", self.id).as_str());
+            .extend(format!("_{}_cut_and_choose", self.id).as_str());
         let seed = ro.evaluate(&msg_before_fiat_shamir);
-        let challenge = Self::challenge(seed.as_slice(), self.nodes.n());
+        let challenge = Self::challenge(seed.as_slice(), self.nodes.total_weight());
 
         // Reveal the scalars corresponding to the challenge bits.
         let processed_pairs = izip!(
@@ -201,7 +197,6 @@ where
         .map(|(share_id, chal, &values)| {
             let share = self.vss_sk.eval(share_id).value;
             let infos = (0..NUM_OF_ENCRYPTIONS_PER_SHARE)
-                .into_iter()
                 .map(|i| {
                     if chal[i] {
                         EncryptionInfo::ForVerification { k_x_g: values[i].1 }
@@ -232,7 +227,7 @@ where
     ) -> FastCryptoResult<()> {
         // Check the degree of the sender's polynomial..
         verify_deg_t_poly(
-            self.nodes.n() - self.t - 1,
+            self.nodes.total_weight() - self.t - 1,
             &msg.partial_pks,
             &self.precomputed_dual_code_coefficients,
             rng,
@@ -245,9 +240,9 @@ where
         };
         let ro = self
             .random_oracle
-            .extend(format!("-{}-cut-and-choose", msg.sender).as_str());
+            .extend(format!("_{}_cut_and_choose", msg.sender).as_str());
         let seed = ro.evaluate(&msg_before_fiat_shamir);
-        let challenge = Self::challenge(seed.as_slice(), self.nodes.n());
+        let challenge = Self::challenge(seed.as_slice(), self.nodes.total_weight());
 
         let mut pairs_to_check = Vec::new();
         let mut tuples_to_check = Vec::new();
@@ -320,8 +315,7 @@ where
     pub fn compute_final_pks(&self, messages: &[Message<G>]) -> (G, Vec<G>) {
         assert!(self.is_above_t(messages).is_ok());
 
-        let partial_pks = (0..self.nodes.n())
-            .into_iter()
+        let partial_pks = (0..self.nodes.total_weight())
             .map(|i| {
                 messages
                     .iter()
@@ -338,9 +332,8 @@ where
             .map(|(i, pk)| Eval {
                 index: NonZeroU32::new((i + 1) as u32).expect("non zero"),
                 value: *pk,
-            })
-            .collect::<Vec<Eval<G>>>();
-        let pk = Poly::<G>::recover_c0(self.t, &evals).expect("enough shares");
+            });
+        let pk = Poly::<G>::recover_c0(self.t, evals).expect("enough shares");
 
         (pk, partial_pks)
     }

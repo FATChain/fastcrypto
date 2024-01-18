@@ -8,27 +8,21 @@
     rust_2021_compatibility
 )]
 
-//! An experimental crate that implements threshold BLS (tBLS) and distributed key generation (DKG)
+//! A crate that implements threshold BLS (tBLS) and distributed key generation (DKG)
 //! protocols.
 
-// This is a hack for not repeating the conditional compilation for each module.
-#[cfg(any(test, feature = "experimental"))]
-#[path = ""]
-mod tbls_modules {
-    pub mod dkg;
-    pub mod dl_verification;
-    pub mod ecies;
-    pub mod mocked_dkg;
-    pub mod nidkg;
-    pub mod nodes;
-    pub mod polynomial;
-    pub mod random_oracle;
-    pub mod tbls;
-    pub mod types;
-}
+pub mod dkg;
+pub mod dl_verification;
+pub mod ecies;
+pub mod nizk;
+pub mod nodes;
+pub mod polynomial;
+pub mod random_oracle;
+pub mod tbls;
+pub mod types;
 
 #[cfg(any(test, feature = "experimental"))]
-pub use tbls_modules::*;
+pub mod nidkg;
 
 #[cfg(test)]
 #[path = "tests/tbls_tests.rs"]
@@ -57,3 +51,7 @@ pub mod nodes_tests;
 #[cfg(test)]
 #[path = "tests/nidkg_tests.rs"]
 pub mod nidkg_tests;
+
+#[cfg(test)]
+#[path = "tests/nizk_tests.rs"]
+pub mod nizk_tests;

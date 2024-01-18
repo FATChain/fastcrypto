@@ -16,9 +16,11 @@ fn dot<S: Scalar>(v1: &[S], v2: &[S]) -> S {
         .fold(S::zero(), |acc, (a, b)| acc + *a * *b)
 }
 
-/// Given a set of indexes <a1, a2, ..., an> and a vector of random scalars <r1, r2, ..., rn>,
-/// returns the vector v such that <v, c> = \sum ri * p(ai) for a polynomial p with coefficients c.
-pub fn batch_coefficients<S: Scalar>(r: &[S], indexes: &[S], degree: u32) -> Vec<S> {
+/// Given a set of indexes (a1, a2, ..., an) and a vector of random scalars (r1, r2, ..., rn),
+/// returns the vector v such that <v, c> = \sum ri * p(ai) for the polynomial p with coefficients c
+/// and the given degree.
+pub(crate) fn batch_coefficients<S: Scalar>(r: &[S], indexes: &[S], degree: u32) -> Vec<S> {
+    assert!(r.len() == indexes.len() && degree > 0); // Should never happen
     let mut multiplies = r.to_vec();
     let mut res = Vec::<S>::new();
     for i in 0..=degree {
@@ -44,6 +46,10 @@ pub fn verify_poly_evals<G: GroupElement + MultiScalarMul, R: AllowedRng>(
     poly: &Poly<G>,
     rng: &mut R,
 ) -> FastCryptoResult<()> {
+    assert!(poly.degree() > 0);
+    if evals.is_empty() {
+        return Ok(());
+    }
     let rs = get_random_scalars::<G::ScalarType, R>(evals.len() as u32, rng);
 
     let lhs = G::generator() * dot(&rs, &evals.iter().map(|e| e.value).collect::<Vec<_>>());
@@ -56,9 +62,10 @@ pub fn verify_poly_evals<G: GroupElement + MultiScalarMul, R: AllowedRng>(
     let rhs = G::multi_scalar_mul(&coeffs, poly.as_vec()).expect("sizes match");
 
     if lhs != rhs {
-        return Err(FastCryptoError::InvalidProof);
+        Err(FastCryptoError::InvalidProof)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 /// Check that a pair (k, H) satisfies H = k*G using a random combination of the pairs and
@@ -175,7 +182,6 @@ pub fn verify_equal_exponents<R: AllowedRng>(
     Ok(())
 }
 
-pub fn get_random_scalars<S: Scalar, R: AllowedRng>(n: u32, rng: &mut R) -> Vec<S> {
-    // TODO: can use 40 bits instead of 64 ("& 0x000F_FFFF_FFFF_FFFF" below)
+pub(crate) fn get_random_scalars<S: Scalar, R: AllowedRng>(n: u32, rng: &mut R) -> Vec<S> {
     (0..n).map(|_| S::from(rng.next_u64())).collect::<Vec<_>>()
 }

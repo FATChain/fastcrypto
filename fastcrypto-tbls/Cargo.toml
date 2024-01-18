@@ -1,46 +1,55 @@
 [package]
 name = "fastcrypto-tbls"
 version = "0.1.0"
+
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Mysten Labs <build@mystenlabs.com>"]
+
+authors = [ "Mysten Labs <build@mystenlabs.com>" ]
 readme = "README.md"
+
 description = "Threshold BLS and DKG protocols"
 repository = "https://github.com/MystenLabs/fastcrypto"
 
 [dependencies]
-fastcrypto = { path = "../fastcrypto", features = ["experimental"]}
+fastcrypto = { path = "../fastcrypto", features = [ "beacon-dkg" ] }
 fastcrypto-derive = { path = "../fastcrypto-derive" }
 
-zeroize.workspace = true
+bcs.workspace = true
+bincode.workspace = true
+digest.workspace = true
 rand.workspace = true
 serde.workspace = true
-bincode.workspace = true
-typenum.workspace = true
 sha3.workspace = true
-digest.workspace = true
-bcs.workspace = true
+tracing.workspace = true
+typenum.workspace = true
+zeroize.workspace = true
 
-itertools = "0.10.5"
+hex = "0.4.3"
+itertools = "0.12"
+tap = { version = "1.0.1", features = [  ] }
 
 [dev-dependencies]
-criterion = "0.4.0"
+criterion = "0.5"
+generic-tests = "0.1.2"
+tracing-test = "0.2.4"
 
 [[bench]]
+harness = false
 name = "polynomial"
-harness = false
-required-features = ["experimental"]
 
 [[bench]]
+harness = false
 name = "dkg"
-harness = false
-required-features = ["experimental"]
 
 [[bench]]
-name = "nidkg"
 harness = false
-required-features = ["experimental"]
+name = "nidkg"
+required-features = [ "experimental" ]
+
+[[bench]]
+harness = false
+name = "tbls"
 
 [features]
-default = []
-experimental = []
+default = [  ]

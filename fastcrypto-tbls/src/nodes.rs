@@ -6,27 +6,31 @@ use crate::types::ShareIndex;
 use fastcrypto::error::FastCryptoError::InvalidInput;
 use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::GroupElement;
+use fastcrypto::hash::{Blake2b256, Digest, HashFunction};
 use serde::{Deserialize, Serialize};
-use std::iter::Map;
-use std::ops::RangeInclusive;
 
 pub type PartyId = u16;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Public parameters of a party.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node<G: GroupElement> {
     pub id: PartyId,
     pub pk: ecies::PublicKey<G>,
-    pub weight: u16,
+    pub weight: u16, // May be zero
 }
 
+/// Wrapper for a set of nodes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nodes<G: GroupElement> {
-    nodes: Vec<Node<G>>,
-    n: u32, // share ids are 1..n
+    nodes: Vec<Node<G>>, // Party ids are 0..len(nodes)-1 (inclusive)
+    total_weight: u32,   // Share ids are 1..total_weight (inclusive)
+    // Next two fields are used to map share ids to party ids.
+    accumulated_weights: Vec<u32>, // Accumulated sum of all nodes' weights. Used to map share ids to party ids.
+    nodes_with_nonzero_weight: Vec<u16>, // Indexes of nodes with non-zero weight
 }
 
-impl<G: GroupElement> Nodes<G> {
-    /// Create a new set of nodes.
+impl<G: GroupElement + Serialize> Nodes<G> {
+    /// Create a new set of nodes. Nodes must have consecutive ids starting from 0.
     pub fn new(nodes: Vec<Node<G>>) -> FastCryptoResult<Self> {
         let mut nodes = nodes;
         nodes.sort_by_key(|n| n.id);
@@ -34,14 +38,55 @@ impl<G: GroupElement> Nodes<G> {
         if (0..nodes.len()).any(|i| (nodes[i].id as usize) != i) {
             return Err(FastCryptoError::InvalidInput);
         }
-        // Get the total weight of the nodes
-        let n = nodes.iter().map(|n| n.weight as u32).sum::<u32>();
-        Ok(Self { nodes, n })
+        // Make sure we never overflow, as we don't expect to have more than 1000 nodes
+        if nodes.is_empty() || nodes.len() > 1000 {
+            return Err(FastCryptoError::InvalidInput);
+        }
+
+        // We use the next two to map share ids to party ids.
+        let accumulated_weights = Self::get_accumulated_weights(&nodes);
+        let nodes_with_nonzero_weight = Self::filter_nonzero_weights(&nodes);
+
+        let total_weight = *accumulated_weights
+            .last()
+            .expect("Number of nodes is non-zero");
+
+        Ok(Self {
+            nodes,
+            total_weight,
+            accumulated_weights,
+            nodes_with_nonzero_weight,
+        })
+    }
+
+    fn filter_nonzero_weights(nodes: &[Node<G>]) -> Vec<u16> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| if n.weight > 0 { Some(i as u16) } else { None })
+            .collect::<Vec<_>>()
+    }
+
+    fn get_accumulated_weights(nodes: &[Node<G>]) -> Vec<u32> {
+        nodes
+            .iter()
+            .filter_map(|n| {
+                if n.weight > 0 {
+                    Some(n.weight as u32)
+                } else {
+                    None
+                }
+            })
+            .scan(0, |accumulated_weight, weight| {
+                *accumulated_weight += weight;
+                Some(*accumulated_weight)
+            })
+            .collect::<Vec<_>>()
     }
 
     /// Total weight of the nodes.
-    pub fn n(&self) -> u32 {
-        self.n
+    pub fn total_weight(&self) -> u32 {
+        self.total_weight
     }
 
     /// Number of nodes.
@@ -50,22 +95,20 @@ impl<G: GroupElement> Nodes<G> {
     }
 
     /// Get an iterator on the share ids.
-    pub fn share_ids_iter(&self) -> Map<RangeInclusive<u32>, fn(u32) -> ShareIndex> {
-        (1..=self.n).map(|i| ShareIndex::new(i).expect("nonzero"))
+    pub fn share_ids_iter(&self) -> impl Iterator<Item = ShareIndex> {
+        (1..=self.total_weight).map(|i| ShareIndex::new(i).expect("nonzero"))
     }
 
     /// Get the node corresponding to a share id.
     pub fn share_id_to_node(&self, share_id: &ShareIndex) -> FastCryptoResult<&Node<G>> {
-        // TODO: [perf opt] Cache this
-        let mut curr_share_id = 1;
-        for n in &self.nodes {
-            if curr_share_id <= share_id.get() && share_id.get() < curr_share_id + (n.weight as u32)
-            {
-                return Ok(n);
-            }
-            curr_share_id += n.weight as u32;
+        let nonzero_node_id = match self.accumulated_weights.binary_search(&share_id.get()) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        match self.nodes_with_nonzero_weight.get(nonzero_node_id) {
+            Some(node_id) => self.node_id_to_node(*node_id),
+            None => Err(InvalidInput),
         }
-        Err(FastCryptoError::InvalidInput)
     }
 
     pub fn node_id_to_node(&self, party_id: PartyId) -> FastCryptoResult<&Node<G>> {
@@ -87,6 +130,12 @@ impl<G: GroupElement> Nodes<G> {
     /// Get an iterator on the nodes.
     pub fn iter(&self) -> impl Iterator<Item = &Node<G>> {
         self.nodes.iter()
+    }
+
+    pub fn hash(&self) -> Digest<32> {
+        let mut hash = Blake2b256::default();
+        hash.update(bcs::to_bytes(&self.nodes).expect("should serialize"));
+        hash.finalize()
     }
 
     /// Reduce weights up to an allowed delta in the original total weight.
@@ -113,8 +162,18 @@ impl<G: GroupElement> Nodes<G> {
                 weight: n.weight / max_d,
             })
             .collect::<Vec<_>>();
-        let n = nodes.iter().map(|n| n.weight as u32).sum::<u32>();
+        let accumulated_weights = Self::get_accumulated_weights(&nodes);
+        let nodes_with_nonzero_weight = Self::filter_nonzero_weights(&nodes);
+        let total_weight = nodes.iter().map(|n| n.weight as u32).sum::<u32>();
         let new_t = t / max_d + (t % max_d != 0) as u16;
-        (Self { nodes, n }, new_t)
+        (
+            Self {
+                nodes,
+                total_weight,
+                accumulated_weights,
+                nodes_with_nonzero_weight,
+            },
+            new_t,
+        )
     }
 }

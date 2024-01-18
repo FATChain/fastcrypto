@@ -3,24 +3,29 @@
 
 use std::str::FromStr;
 
-use crate::bn254::utils::{gen_address_seed, get_nonce, get_proof, get_salt, get_zk_login_address};
+use crate::bn254::poseidon::poseidon_zk_login;
+use crate::bn254::utils::{
+    big_int_str_to_bytes, gen_address_seed, gen_address_seed_with_salt_hash, get_nonce,
+    get_zk_login_address,
+};
 use crate::bn254::zk_login::{
-    convert_base, decode_base64_url, hash_ascii_str_to_field, hash_to_field, parse_jwks, trim,
-    verify_extended_claim, Claim, JWTDetails, JWTHeader, JwkId,
+    convert_base, decode_base64_url, hash_ascii_str_to_field, hash_to_field, parse_jwks, to_field,
+    trim, verify_extended_claim, Claim, JWTDetails, JwkId,
 };
 use crate::bn254::zk_login::{fetch_jwks, OIDCProvider};
-use crate::bn254::zk_login_api::Bn254Fr;
 use crate::bn254::zk_login_api::ZkLoginEnv;
+use crate::bn254::zk_login_api::{verify_zk_login_id, verify_zk_login_iss, Bn254Fr};
 use crate::bn254::{
     zk_login::{ZkLoginInputs, JWK},
     zk_login_api::verify_zk_login,
 };
+use ark_bn254::Fr;
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::SeedableRng;
 use fastcrypto::ed25519::Ed25519KeyPair;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::error::FastCryptoError;
-use fastcrypto::jwt_utils::parse_and_validate_jwt;
+use fastcrypto::jwt_utils::JWTHeader;
 use fastcrypto::traits::KeyPair;
 use im::hashmap::HashMap as ImHashMap;
 use num_bigint::BigUint;
@@ -80,12 +85,12 @@ const FACEBOOK_JWK_BYTES: &[u8] = r#"{
     }"#.as_bytes();
 
 const BAD_JWK_BYTES: &[u8] = r#"{
-        "keys":[{"alg":"RS256","e":"AQAB","kid":"1","kty":"RSA","n":"6lq9MQ-q6hcxr7kOUp-tHlHtdcDsVLwVIw13iXUCvuDOeCi0VSuxCCUY6UmMjy53dX00ih2E4Y4UvlrmmurK0eG26b-HMNNAvCGsVXHU3RcRhVoHDaOwHwU72j7bpHn9XbP3Q3jebX6KIfNbei2MiR0Wyb8RZHE-aZhRYO8_-k9G2GycTpvc-2GBsP8VHLUKKfAs2B6sW3q3ymU6M0L-cFXkZ9fHkn9ejs-sqZPhMJxtBPBxoUIUQFTgv4VXTSv914f_YkNw-EjuwbgwXMvpyr06EyfImxHoxsZkFYB-qBYHtaMxTnFsZBr6fn8Ha2JqT1hoP7Z5r5wxDu3GQhKkHw","use":"wrong usage"}]
+        "keys":[{"alg":"ES256","e":"AQAB","kid":"1","kty":"RSA","n":"6lq9MQ-q6hcxr7kOUp-tHlHtdcDsVLwVIw13iXUCvuDOeCi0VSuxCCUY6UmMjy53dX00ih2E4Y4UvlrmmurK0eG26b-HMNNAvCGsVXHU3RcRhVoHDaOwHwU72j7bpHn9XbP3Q3jebX6KIfNbei2MiR0Wyb8RZHE-aZhRYO8_-k9G2GycTpvc-2GBsP8VHLUKKfAs2B6sW3q3ymU6M0L-cFXkZ9fHkn9ejs-sqZPhMJxtBPBxoUIUQFTgv4VXTSv914f_YkNw-EjuwbgwXMvpyr06EyfImxHoxsZkFYB-qBYHtaMxTnFsZBr6fn8Ha2JqT1hoP7Z5r5wxDu3GQhKkHw","use":"wrong usage"}]
       }"#.as_bytes();
 
 #[tokio::test]
 async fn test_verify_zk_login_google() {
-    let user_salt = "6588741469050502421550140105345050859";
+    let user_salt = "206703048842351542647799591018316385612";
 
     // Generate an ephermeral key pair.
     let kp = Ed25519KeyPair::generate(&mut StdRng::from_seed([0; 32]));
@@ -97,16 +102,15 @@ async fn test_verify_zk_login_google() {
         user_salt,
         "sub",
         "106294049240999307923",
-        "575519204237-msop9ep45u2uo98hapqmngv8d84qdc8k.apps.googleusercontent.com",
+        "25769832374-famecqrhe2gkebt5fvqms2263046lj96.apps.googleusercontent.com",
     )
     .unwrap();
 
     // Get a proof from endpoint and serialize it.
-    let zk_login_inputs = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"2856853953075769800124894014261522454473628840903733396791436551678646353442\",\"4348380563251612781076847536132734724007250850537898584606264407881192024038\",\"1\"],\"b\":[[\"7104233243273112157690495334540581786527679292989961607293820809756711817804\",\"7316749226455433333548431623049338347566433057852078652116817664859892729141\"],[\"7958969331644439362228660274459003086243454411183553950363953885927343087881\",\"9141838677170549853312103207759293328734516367022724639309880085475013934164\"],[\"1\",\"0\"]],\"c\":[\"1072805970412254746706019205992636576449727696915026862715527704402621159155\",\"20831495984663317011121876045853230024971218945035273863127537706741828164445\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6IjgzOGMwNmM2MjA0NmMyZDk0OGFmZmUxMzdkZDUzMTAxMjlmNGQ1ZDEiLCJ0eXAiOiJKV1QifQ\"}", &address_seed).unwrap();
-
+    let zk_login_inputs = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"8247215875293406890829839156897863742504615191361518281091302475904551111016\",\"6872980335748205979379321982220498484242209225765686471076081944034292159666\",\"1\"],\"b\":[[\"21419680064642047510915171723230639588631899775315750803416713283740137406807\",\"21566716915562037737681888858382287035712341650647439119820808127161946325890\"],[\"17867714710686394159919998503724240212517838710399045289784307078087926404555\",\"21812769875502013113255155836896615164559280911997219958031852239645061854221\"],[\"1\",\"0\"]],\"c\":[\"7530826803702928198368421787278524256623871560746240215547076095911132653214\",\"16244547936249959771862454850485726883972969173921727256151991751860694123976\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6IjZmNzI1NDEwMWY1NmU0MWNmMzVjOTkyNmRlODRhMmQ1NTJiNGM2ZjEiLCJ0eXAiOiJKV1QifQ\"}", &address_seed).unwrap();
     assert_eq!(
         zk_login_inputs.get_kid(),
-        "838c06c62046c2d948affe137dd5310129f4d5d1".to_string()
+        "6f7254101f56e41cf35c9926de84a2d552b4c6f1".to_string()
     );
     assert_eq!(
         zk_login_inputs.get_iss(),
@@ -120,37 +124,32 @@ async fn test_verify_zk_login_google() {
         )
         .unwrap()
         .to_vec(),
-        Hex::decode("0x1c6b623a2f2c91333df730c98d220f11484953b391a3818680f922c264cc0c6b").unwrap()
+        Hex::decode("0xa64ae946d5efd2dea396cb2fe81837f028c32f2b2f211176b65a3a152deb35a2").unwrap()
     );
 
     let mut map = ImHashMap::new();
     let content = JWK {
         kty: "RSA".to_string(),
         e: "AQAB".to_string(),
-        n: "hsYvCPtkUV7SIxwkOkJsJfhwV_CMdXU5i0UmY2QEs-Pa7v0-0y-s4EjEDtsQ8Yow6hc670JhkGBcMzhU4DtrqNGROXebyOse5FX0m0UvWo1qXqNTf28uBKB990mY42Icr8sGjtOw8ajyT9kufbmXi3eZKagKpG0TDGK90oBEfoGzCxoFT87F95liNth_GoyU5S8-G3OqIqLlQCwxkI5s-g2qvg_aooALfh1rhvx2wt4EJVMSrdnxtPQSPAtZBiw5SwCnVglc6OnalVNvAB2JArbqC9GAzzz9pApAk28SYg5a4hPiPyqwRv-4X1CXEK8bO5VesIeRX0oDf7UoM-pVAw".to_string(),
+        n: "oUriU8GqbRw-avcMn95DGW1cpZR1IoM6L7krfrWvLSSCcSX6Ig117o25Yk7QWBiJpaPV0FbP7Y5-DmThZ3SaF0AXW-3BsKPEXfFfeKVc6vBqk3t5mKlNEowjdvNTSzoOXO5UIHwsXaxiJlbMRalaFEUm-2CKgmXl1ss_yGh1OHkfnBiGsfQUndKoHiZuDzBMGw8Sf67am_Ok-4FShK0NuR3-q33aB_3Z7obC71dejSLWFOEcKUVCaw6DGVuLog3x506h1QQ1r0FXKOQxnmqrRgpoHqGSouuG35oZve1vgCU4vLZ6EAgBAbC0KL35I7_0wUDSMpiAvf7iZxzJVbspkQ".to_string(),
         alg: "RS256".to_string(),
     };
 
     map.insert(
         JwkId::new(
             OIDCProvider::Google.get_config().iss,
-            "838c06c62046c2d948affe137dd5310129f4d5d1".to_string(),
+            "6f7254101f56e41cf35c9926de84a2d552b4c6f1".to_string(),
         ),
         content,
     );
-    let res = verify_zk_login(&zk_login_inputs, 10, &eph_pubkey, &map, &ZkLoginEnv::Test);
+    let res = verify_zk_login(&zk_login_inputs, 10, &eph_pubkey, &map, &ZkLoginEnv::Prod);
     assert!(res.is_ok());
-
-    // Do not verify against the prod vk.
-    let res1 = verify_zk_login(&zk_login_inputs, 10, &eph_pubkey, &map, &ZkLoginEnv::Prod);
-    assert!(res1.is_err());
 }
 
 #[test]
 fn test_parse_jwt_details() {
     let header = JWTHeader::new("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjEifQ").unwrap();
-    assert_eq!(header.alg, "RS256");
-    assert_eq!(header.typ, "JWT");
+    assert_eq!(header.kid, "1");
 
     // Invalid base64
     assert_eq!(
@@ -427,6 +426,9 @@ async fn test_get_jwks() {
         OIDCProvider::Facebook,
         OIDCProvider::Google,
         OIDCProvider::Twitch,
+        OIDCProvider::Slack,
+        OIDCProvider::Kakao,
+        OIDCProvider::Apple,
     ] {
         let res = fetch_jwks(&p, &client).await;
         assert!(res.is_ok());
@@ -473,60 +475,146 @@ fn test_gen_seed() {
     );
 }
 
-#[ignore = "can't connect to gen_salt"]
-#[tokio::test]
-async fn test_end_to_end_twitch() {
-    // Use a fixed Twitch token obtained with nonce hTPpgF7XAKbW37rEUS6pEVZqmoI
-    // Derived based on max_epoch = 10, kp generated from seed = [0; 32], and jwt_randomness 100681567828351849884072155819400689117.
-    let parsed_token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjEifQ.eyJhdWQiOiJyczFiaDA2NWk5eWE0eWR2aWZpeGw0a3NzMHVocHQiLCJleHAiOjE2OTIyODQzMzQsImlhdCI6MTY5MjI4MzQzNCwiaXNzIjoiaHR0cHM6Ly9pZC50d2l0Y2gudHYvb2F1dGgyIiwic3ViIjoiOTA0NDQ4NjkyIiwiYXpwIjoicnMxYmgwNjVpOXlhNHlkdmlmaXhsNGtzczB1aHB0Iiwibm9uY2UiOiJoVFBwZ0Y3WEFLYlczN3JFVVM2cEVWWnFtb0kiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJqb3lxdnEifQ.M54Sgs6aDu5Mprs_CgXeRbgiErC7oehj-h9oEcBqZFDADwd09zs9hbfDPqUjaNBB-_I6G7kn9e-zwPov8PUecI68kr3oyiCMWhKD-3h1FEu13MZv71B6jhIDMu1_UgI-RSrOQMRvdI8eL3qqD-KsvJuJH1Sz0w56PnB0xupUg-eSvgnMBAo6iTa0t1grX9qGy7U00i_oqn9J4jVGVVEbMhUWROJMjowWdOogJ4_VNqm67JHd_rMZ3xtjLabP6Nk1Gx-VjUbYceNADWUr5xpJveRtvb1FJvd0HSN4mab51zuSUnavCQw2OXbyoH8j6uuQAAKVhG-_Ht1hCvReycGXKw";
-    let max_epoch = 10;
-    let jwt_randomness = "100681567828351849884072155819400689117";
+#[test]
+fn test_verify_zk_login() {
+    // Test vector from [test_verify_zk_login_google]
+    let address =
+        hex::decode("1c6b623a2f2c91333df730c98d220f11484953b391a3818680f922c264cc0c6b").unwrap();
+    let name = "sub";
+    let value = "106294049240999307923";
+    let aud = "575519204237-msop9ep45u2uo98hapqmngv8d84qdc8k.apps.googleusercontent.com";
+    let salt = "6588741469050502421550140105345050859";
+    let iss = "https://accounts.google.com";
+    let salt_hash = poseidon_zk_login(vec![to_field(salt).unwrap()])
+        .unwrap()
+        .to_string();
+    assert!(verify_zk_login_id(&address, name, value, aud, iss, &salt_hash).is_ok());
 
-    // Get salt based on the Twitch token.
-    let user_salt = get_salt(parsed_token).await.unwrap();
+    let address_seed = gen_address_seed_with_salt_hash(&salt_hash, name, value, aud).unwrap();
+    assert!(verify_zk_login_iss(&address, &address_seed, iss).is_ok());
 
-    // Generate an ephermeral key pair.
-    let kp = Ed25519KeyPair::generate(&mut StdRng::from_seed([0; 32]));
-    let mut eph_pubkey = vec![0x00];
-    eph_pubkey.extend(kp.public().as_ref());
-    let kp_bigint = BigUint::from_bytes_be(&eph_pubkey).to_string();
+    let other_iss = "https://some.other.issuer.com";
+    assert_eq!(
+        verify_zk_login_id(&address, name, value, aud, other_iss, &salt_hash),
+        Err(FastCryptoError::InvalidProof)
+    );
+    assert_eq!(
+        verify_zk_login_iss(&address, &address_seed, other_iss),
+        Err(FastCryptoError::InvalidProof)
+    );
 
-    // Get a proof from endpoint and serialize it.
-    let reader = get_proof(
-        parsed_token,
-        max_epoch,
-        jwt_randomness,
-        &kp_bigint,
-        &user_salt,
+    let too_long_kc_name = "subsubsubsubsubsubsubsubsubsubsubsub";
+    assert_eq!(
+        verify_zk_login_id(
+            &address,
+            too_long_kc_name,
+            value,
+            aud,
+            other_iss,
+            &salt_hash
+        ),
+        Err(FastCryptoError::GeneralError("in_arr too long".to_string()))
+    );
+
+    let too_long_kc_value = "106294049240999307923106294049240999307923106294049240999307923106294049240999307923106294049240999307923106294049240999307923";
+    assert_eq!(
+        verify_zk_login_id(
+            &address,
+            name,
+            too_long_kc_value,
+            aud,
+            other_iss,
+            &salt_hash
+        ),
+        Err(FastCryptoError::GeneralError("in_arr too long".to_string()))
+    );
+}
+
+#[test]
+fn test_all_inputs_hash() {
+    let jwt_sha2_hash_0 = Fr::from_str("248987002057371616691124650904415756047").unwrap();
+    let jwt_sha2_hash_1 = Fr::from_str("113498781424543581252500776698433499823").unwrap();
+    let masked_content_hash = Fr::from_str(
+        "14900420995580824499222150327925943524564997104405553289134597516335134742309",
     )
-    .await
     .unwrap();
-    let (sub, aud) = parse_and_validate_jwt(parsed_token).unwrap();
-    // Get the address seed.
-    let address_seed = gen_address_seed(&user_salt, "sub", &sub, &aud).unwrap();
-    let zk_login_inputs = ZkLoginInputs::from_reader(reader, &address_seed).unwrap();
-    // Make a map of jwk ids to jwks just for Twitch.
-    let mut map = ImHashMap::new();
-    map.insert(
+    let payload_start_index = Fr::from_str("103").unwrap();
+    let payload_len = Fr::from_str("564").unwrap();
+    let eph_public_key_0 = Fr::from_str("17932473587154777519561053972421347139").unwrap();
+    let eph_public_key_1 = Fr::from_str("134696963602902907403122104327765350261").unwrap();
+    let max_epoch = Fr::from_str("10000").unwrap();
+    let num_sha2_blocks = Fr::from_str("11").unwrap();
+    let key_claim_name_f = Fr::from_str(
+        "18523124550523841778801820019979000409432455608728354507022210389496924497355",
+    )
+    .unwrap();
+    let addr_seed = Fr::from_str(
+        "15604334753912523265015800787270404628529489918817818174033741053550755333691",
+    )
+    .unwrap();
+
+    let hash = poseidon_zk_login(vec![
+        jwt_sha2_hash_0,
+        jwt_sha2_hash_1,
+        masked_content_hash,
+        payload_start_index,
+        payload_len,
+        eph_public_key_0,
+        eph_public_key_1,
+        max_epoch,
+        num_sha2_blocks,
+        key_claim_name_f,
+        addr_seed,
+    ])
+    .unwrap();
+    assert_eq!(
+        hash.to_string(),
+        "2487117669597822357956926047501254969190518860900347921480370492048882803688".to_string()
+    );
+}
+#[test]
+fn test_alternative_iss_for_google() {
+    let input = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"7566241567720780416751598994698310678767195459947224622023785587667176814058\",\"18104499930818305143361187733659014043953751050617136254447624192327280445771\",\"1\"],\"b\":[[\"11369230593957954942221175389182778816136534144714579815927653075736806430994\",\"11928003240637992017698644299021052465098754853899210401706726930513411198353\"],[\"2597127058046351054449743605218058440565462021354202666955356076272028963802\",\"3385145993275542896693643488618289924488296318344621918448585222369718288892\"],[\"1\",\"0\"]],\"c\":[\"395141536511114303768253959602639884294254888080713473665269769443249414257\",\"21430657725804540809568084344756144327539843580919730138594118365564728808275\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImM5YWZkYTM2ODJlYmYwOWViMzA1NWMxYzRiZDM5Yjc1MWZiZjgxOTUiLCJ0eXAiOiJKV1QifQ\"}", "4959624758616676340947699768172740454110375485415332267384397278368360470616").unwrap();
+    let invalid_proof_input = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"1\",\"18104499930818305143361187733659014043953751050617136254447624192327280445771\",\"1\"],\"b\":[[\"1\",\"11928003240637992017698644299021052465098754853899210401706726930513411198353\"],[\"2597127058046351054449743605218058440565462021354202666955356076272028963802\",\"3385145993275542896693643488618289924488296318344621918448585222369718288892\"],[\"1\",\"0\"]],\"c\":[\"395141536511114303768253959602639884294254888080713473665269769443249414257\",\"21430657725804540809568084344756144327539843580919730138594118365564728808275\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImM5YWZkYTM2ODJlYmYwOWViMzA1NWMxYzRiZDM5Yjc1MWZiZjgxOTUiLCJ0eXAiOiJKV1QifQ\"}", "4959624758616676340947699768172740454110375485415332267384397278368360470616").unwrap();
+    let _ = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"18104499930818305143361187733659014043953751050617136254447624192327280445771\",\"1\"],\"b\":[[\"11369230593957954942221175389182778816136534144714579815927653075736806430994\",\"11928003240637992017698644299021052465098754853899210401706726930513411198353\"],[\"2597127058046351054449743605218058440565462021354202666955356076272028963802\",\"3385145993275542896693643488618289924488296318344621918448585222369718288892\"],[\"1\",\"0\"]],\"c\":[\"395141536511114303768253959602639884294254888080713473665269769443249414257\",\"21430657725804540809568084344756144327539843580919730138594118365564728808275\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImM5YWZkYTM2ODJlYmYwOWViMzA1NWMxYzRiZDM5Yjc1MWZiZjgxOTUiLCJ0eXAiOiJKV1QifQ\"}", "4959624758616676340947699768172740454110375485415332267384397278368360470616").is_err();
+    let _ = ZkLoginInputs::from_json("{\"proofPoints\":{\"a\":[\"18104499930818305143361187733659014043953751050617136254447624192327280445771\",\"1\"],\"b\":[[\"11369230593957954942221175389182778816136534144714579815927653075736806430994\",\"11928003240637992017698644299021052465098754853899210401706726930513411198353\"],[\"2597127058046351054449743605218058440565462021354202666955356076272028963802\",\"3385145993275542896693643488618289924488296318344621918448585222369718288892\"],[\"1\",\"0\"]],\"c\":[\"395141536511114303768253959602639884294254888080713473665269769443249414257\",\"21430657725804540809568084344756144327539843580919730138594118365564728808275\",\"1\"]},\"issBase64Details\":{\"value\":\"yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC\",\"indexMod4\":1},\"headerBase64\":\"eyJhbGciOiJSUzI1NiIsImtpZCI6ImM5YWZkYTM2ODJlYmYwOWViMzA1NWMxYzRiZDM5Yjc1MWZiZjgxOTUiLCJ0eXAiOiJKV1QifQ\"}", "bad seed").is_err();
+
+    let mut eph_pubkey_bytes = vec![0];
+    eph_pubkey_bytes.extend(
+        big_int_str_to_bytes(
+            "3598866369818193253063936208363210863933653800990958031560302098730308306242903464",
+        )
+        .unwrap(),
+    );
+    let mut all_jwk = ImHashMap::new();
+    all_jwk.insert(
         JwkId::new(
-            OIDCProvider::Twitch.get_config().iss,
-            "1".to_string(),
+            OIDCProvider::Google.get_config().iss,
+            "c9afda3682ebf09eb3055c1c4bd39b751fbf8195".to_string(),
         ),
         JWK {
             kty: "RSA".to_string(),
             e: "AQAB".to_string(),
-            n: "6lq9MQ-q6hcxr7kOUp-tHlHtdcDsVLwVIw13iXUCvuDOeCi0VSuxCCUY6UmMjy53dX00ih2E4Y4UvlrmmurK0eG26b-HMNNAvCGsVXHU3RcRhVoHDaOwHwU72j7bpHn9XbP3Q3jebX6KIfNbei2MiR0Wyb8RZHE-aZhRYO8_-k9G2GycTpvc-2GBsP8VHLUKKfAs2B6sW3q3ymU6M0L-cFXkZ9fHkn9ejs-sqZPhMJxtBPBxoUIUQFTgv4VXTSv914f_YkNw-EjuwbgwXMvpyr06EyfImxHoxsZkFYB-qBYHtaMxTnFsZBr6fn8Ha2JqT1hoP7Z5r5wxDu3GQhKkHw".to_string(),
+            n: "whYOFK2Ocbbpb_zVypi9SeKiNUqKQH0zTKN1-6fpCTu6ZalGI82s7XK3tan4dJt90ptUPKD2zvxqTzFNfx4HHHsrYCf2-FMLn1VTJfQazA2BvJqAwcpW1bqRUEty8tS_Yv4hRvWfQPcc2Gc3-_fQOOW57zVy-rNoJc744kb30NjQxdGp03J2S3GLQu7oKtSDDPooQHD38PEMNnITf0pj-KgDPjymkMGoJlO3aKppsjfbt_AH6GGdRghYRLOUwQU-h-ofWHR3lbYiKtXPn5dN24kiHy61e3VAQ9_YAZlwXC_99GGtw_NpghFAuM4P1JDn0DppJldy3PGFC0GfBCZASw".to_string(),
             alg: "RS256".to_string(),
         },
     );
 
-    // Verify it against test vk.
     let res = verify_zk_login(
-        &zk_login_inputs,
-        max_epoch,
-        &eph_pubkey,
-        &map,
+        &input,
+        10000,
+        &eph_pubkey_bytes,
+        &all_jwk,
         &ZkLoginEnv::Test,
     );
     assert!(res.is_ok());
+
+    let invalid_res = verify_zk_login(
+        &invalid_proof_input,
+        10000,
+        &eph_pubkey_bytes,
+        &all_jwk,
+        &ZkLoginEnv::Test,
+    );
+    assert!(invalid_res.is_err());
 }

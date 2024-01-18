@@ -1,21 +1,22 @@
 [workspace]
-resolver = "2"
 members = [
-    "fastcrypto",
-    "fastcrypto-derive",
-    "fastcrypto-tbls",
-    "fastcrypto-zkp",
-    "fastcrypto-cli",
-    "fastcrypto-vdf"
+  "fastcrypto",
+  "fastcrypto-derive",
+  "fastcrypto-tbls",
+  "fastcrypto-zkp",
+  "fastcrypto-cli",
+  "fastcrypto-vdf",
 ]
+resolver = "2"
 
 # Dependencies that should be kept in sync through the whole workspace
 [workspace.dependencies]
-rand = { version = "0.8.5", features = ["std"] }
-serde = { version = "1.0.152", features = ["derive"] }
+bcs = "0.1.4"
 bincode = "1.3.3"
+digest = "0.10.6"
+rand = { version = "0.8.5", features = [ "std" ] }
+serde = { version = "1.0.152", features = [ "derive" ] }
+sha3 = "0.10.6"
+tracing = "0.1.37"
 typenum = "1.16.0"
 zeroize = "1.5.7"
-sha3 = "0.10.6"
-digest = "0.10.6"
-bcs = "0.1.4"

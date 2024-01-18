@@ -1,6 +1,8 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::SystemTime;
+
 use ark_bls12_381::{Bls12_381, Fr};
 pub use ark_ff::ToConstraintField;
 
@@ -17,7 +19,7 @@ use blake2::{digest::Digest, Blake2s256};
 use ark_r1cs_std::prelude::*;
 use ark_std::rand::thread_rng;
 use fastcrypto_zkp::bls12381::conversions::BlsFr;
-use fastcrypto_zkp::bls12381::verifier::{process_vk_special, verify_with_processed_vk};
+use fastcrypto_zkp::bls12381::verifier::PreparedVerifyingKey;
 use fastcrypto_zkp::bls12381::{FieldElement, Proof};
 
 #[derive(Clone, Copy, Debug)]
@@ -84,9 +86,17 @@ impl ConstraintSynthesizer<Fr> for Blake2sCircuit {
     }
 }
 
+fn now() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
 fn main() {
     let mut rng = &mut thread_rng();
 
+    let t0 = now();
     let circuit = Blake2sCircuit::new();
     // Sanity-check
     {
@@ -96,23 +106,28 @@ fn main() {
         println!("Num constraints: {}", cs.num_constraints());
         assert!(cs.is_satisfied().unwrap());
     }
+    let t1 = now();
+    println!("sanity check ok, costs: {}ms", t1 - t0);
 
     let params =
         Groth16::<Bls12_381>::generate_random_parameters_with_reduction(circuit, rng).unwrap();
 
+    let t2 = now();
+    println!("gen paras costs: {}ms", t2 - t1);
     // prepare a proof (note: there is nothing trustable about the trivial setup involved here)
     let proof = Proof::from(
         Groth16::<Bls12_381>::create_random_proof_with_reduction(circuit, &params, &mut rng)
             .unwrap(),
     );
-
+    let t3 = now();
     println!(
-        "Generated proof of knowledge of Blake2s preimage of {}",
-        hex::encode(circuit.expected_output)
+        "Generated proof of knowledge of Blake2s preimage of {}, costs: {}ms",
+        hex::encode(circuit.expected_output),
+        t3 - t2
     );
 
     // prepare the verification key
-    let pvk = process_vk_special(&params.vk.into());
+    let pvk = PreparedVerifyingKey::from(&params.vk.into());
 
     // provide the public inputs (the hash target) for verification
     let inputs: Vec<FieldElement> = [&circuit.blake2_seed[..], &circuit.expected_output[..]]
@@ -122,9 +137,12 @@ fn main() {
         .collect();
 
     // Verify the proof
-    assert!(verify_with_processed_vk(&pvk, &inputs, &proof).unwrap());
+    assert!(pvk.verify(&inputs, &proof).unwrap());
+    let t4 = now();
+
     println!(
-        "Checked proof of knowledge of Blake2s preimage of {}!",
-        hex::encode(circuit.expected_output)
+        "Checked proof of knowledge of Blake2s preimage of {}!  others costs: {}ms",
+        hex::encode(circuit.expected_output),
+        t4 - t3
     );
 }

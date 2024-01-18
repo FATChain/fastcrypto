@@ -6,13 +6,14 @@
 //
 
 use crate::types::{IndexedValue, ShareIndex};
-use fastcrypto::error::FastCryptoError;
-use fastcrypto::groups::{GroupElement, Scalar};
+use fastcrypto::error::{FastCryptoError, FastCryptoResult};
+use fastcrypto::groups::{GroupElement, MultiScalarMul, Scalar};
 use fastcrypto::traits::AllowedRng;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::HashSet;
 
-//// Types
+/// Types
 
 pub type Eval<A> = IndexedValue<A>;
 
@@ -24,7 +25,7 @@ pub struct Poly<C>(Vec<C>);
 pub type PrivatePoly<C> = Poly<<C as GroupElement>::ScalarType>;
 pub type PublicPoly<C> = Poly<C>;
 
-//// Vector related operations.
+/// Vector related operations.
 
 impl<C> Poly<C> {
     /// Returns the degree of the polynomial
@@ -41,13 +42,7 @@ impl<C> From<Vec<C>> for Poly<C> {
     }
 }
 
-impl<C> From<Poly<C>> for Vec<C> {
-    fn from(poly: Poly<C>) -> Self {
-        poly.0
-    }
-}
-
-//// GroupElement operations.
+/// GroupElement operations.
 
 impl<C: GroupElement> Poly<C> {
     /// Returns a polynomial with the zero element.
@@ -70,11 +65,13 @@ impl<C: GroupElement> Poly<C> {
 
     /// Evaluates the polynomial at the specified value.
     pub fn eval(&self, i: ShareIndex) -> Eval<C> {
+        // Use Horner's Method to evaluate the polynomial.
         let xi = C::ScalarType::from(i.get().into());
-        let res = self.0.iter().rev().fold(C::zero(), |mut sum, coeff| {
-            sum = sum * xi + coeff;
-            sum
-        });
+        let res = self
+            .0
+            .iter()
+            .rev()
+            .fold(C::zero(), |sum, coeff| sum * xi + coeff);
 
         Eval {
             index: i,
@@ -82,56 +79,66 @@ impl<C: GroupElement> Poly<C> {
         }
     }
 
-    /// Given at least `t` polynomial evaluations, it will recover the polynomial's
-    /// constant term
-    pub fn recover_c0(t: u32, shares: &[Eval<C>]) -> Result<C, FastCryptoError> {
-        if shares.len() < t.try_into().unwrap() {
-            return Err(FastCryptoError::InvalidInput);
-        }
-
-        // Check for duplicates.
+    // Expects exactly t unique shares.
+    fn get_lagrange_coefficients_for_c0(
+        t: u32,
+        mut shares: impl Iterator<Item = impl Borrow<Eval<C>>>,
+    ) -> FastCryptoResult<Vec<C::ScalarType>> {
         let mut ids_set = HashSet::new();
-        shares.iter().map(|s| &s.index).for_each(|id| {
-            ids_set.insert(id);
-        });
-        if ids_set.len() != t as usize {
+        let (shares_size_lower, shares_size_upper) = shares.size_hint();
+        let indices = shares.try_fold(
+            Vec::with_capacity(shares_size_upper.unwrap_or(shares_size_lower)),
+            |mut vec, s| {
+                // Check for duplicates.
+                if !ids_set.insert(s.borrow().index) {
+                    return Err(FastCryptoError::InvalidInput); // expected unique ids
+                }
+                vec.push(C::ScalarType::from(s.borrow().index.get() as u64));
+                Ok(vec)
+            },
+        )?;
+        if indices.len() != t as usize {
             return Err(FastCryptoError::InvalidInput);
         }
 
-        // Iterate over all indices and for each multiply the lagrange basis
-        // with the value of the share.
-        let mut acc = C::zero();
-        for IndexedValue {
-            index: i,
-            value: share_i,
-        } in shares
-        {
-            let mut num = C::ScalarType::generator();
-            let mut den = C::ScalarType::generator();
-
-            for IndexedValue { index: j, value: _ } in shares {
-                if i == j {
-                    continue;
-                };
-                // j - 0
-                num = num * C::ScalarType::from(j.get() as u64);
-                // 1 / (j - i)
-                den = den
-                    * (C::ScalarType::from(j.get() as u64) - C::ScalarType::from(i.get() as u64));
-            }
-            // Next line is safe since i != j.
-            let inv = (C::ScalarType::generator() / den).unwrap();
-            acc += *share_i * num * inv;
+        let full_numerator = indices
+            .iter()
+            .fold(C::ScalarType::generator(), |acc, i| acc * i);
+        let mut coeffs = Vec::new();
+        for i in &indices {
+            let denominator = indices
+                .iter()
+                .filter(|j| *j != i)
+                .fold(*i, |acc, j| acc * (*j - i));
+            let coeff = full_numerator / denominator;
+            coeffs.push(coeff.expect("safe since i != j"));
         }
+        Ok(coeffs)
+    }
 
-        Ok(acc)
+    /// Given exactly `t` polynomial evaluations, it will recover the polynomial's constant term.
+    pub fn recover_c0(
+        t: u32,
+        shares: impl Iterator<Item = impl Borrow<Eval<C>>> + Clone,
+    ) -> Result<C, FastCryptoError> {
+        let coeffs = Self::get_lagrange_coefficients_for_c0(t, shares.clone())?;
+        let plain_shares = shares.map(|s| s.borrow().value);
+        let res = coeffs
+            .iter()
+            .zip(plain_shares)
+            .fold(C::zero(), |acc, (c, s)| acc + (s * *c));
+        Ok(res)
     }
 
     /// Checks if a given share is valid.
-    pub fn is_valid_share(&self, idx: ShareIndex, share: &C::ScalarType) -> bool {
+    pub fn verify_share(&self, idx: ShareIndex, share: &C::ScalarType) -> FastCryptoResult<()> {
         let e = C::generator() * share;
         let pub_eval = self.eval(idx);
-        pub_eval.value == e
+        if pub_eval.value == e {
+            Ok(())
+        } else {
+            Err(FastCryptoError::InvalidInput)
+        }
     }
 
     /// Return the constant term of the polynomial.
@@ -145,7 +152,7 @@ impl<C: GroupElement> Poly<C> {
     }
 }
 
-//// Scalar operations.
+/// Scalar operations.
 
 impl<C: Scalar> Poly<C> {
     /// Returns a new polynomial of the given degree where each coefficients is
@@ -162,13 +169,23 @@ impl<C: Scalar> Poly<C> {
         let commits = self
             .0
             .iter()
-            .map(|c| {
-                let mut commitment = P::generator();
-                commitment = commitment * c;
-                commitment
-            })
+            .map(|c| P::generator() * c)
             .collect::<Vec<P>>();
 
         Poly::<P>::from(commits)
+    }
+}
+
+impl<C: GroupElement + MultiScalarMul> Poly<C> {
+    /// Given exactly `t` polynomial evaluations, it will recover the polynomial's
+    /// constant term.
+    pub fn recover_c0_msm(
+        t: u32,
+        shares: impl Iterator<Item = impl Borrow<Eval<C>>> + Clone,
+    ) -> Result<C, FastCryptoError> {
+        let coeffs = Self::get_lagrange_coefficients_for_c0(t, shares.clone())?;
+        let plain_shares = shares.map(|s| s.borrow().value).collect::<Vec<_>>();
+        let res = C::multi_scalar_mul(&coeffs, &plain_shares).expect("sizes match");
+        Ok(res)
     }
 }
